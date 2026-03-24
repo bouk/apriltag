@@ -1184,7 +1184,7 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     if (1) {
         image_u8_t *im_samples = td->debug ? image_u8_copy(im_orig) : NULL;
 
-        int chunksize = 1 + zarray_size(quads) / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        int chunksize = 1 + zarray_size(quads) / (1 * td->nthreads);
 
         struct quad_decode_task *tasks = malloc(sizeof(struct quad_decode_task)*(zarray_size(quads) / chunksize + 1));
 

@@ -108,7 +108,7 @@ struct cluster_task
 };
 
 struct minmax_task {
-    int ty;
+    int ty0, ty1;
 
     image_u8_t *im;
     uint8_t *im_max;
@@ -116,23 +116,25 @@ struct minmax_task {
 };
 
 struct blur_task {
-    int ty;
+    int ty0, ty1;
 
     image_u8_t *im;
     uint8_t *im_max;
     uint8_t *im_min;
     uint8_t *im_max_tmp;
     uint8_t *im_min_tmp;
+    int tw, th;
 };
 
 struct threshold_task {
-    int ty;
+    int ty0, ty1;
 
     apriltag_detector_t *td;
     image_u8_t *im;
     image_u8_t *threshim;
     uint8_t *im_max;
     uint8_t *im_min;
+    int tw, th;
 };
 
 struct remove_vertex
@@ -1111,10 +1113,10 @@ void do_minmax_task(void *p)
     const int tilesz = 4;
     struct minmax_task* task = (struct minmax_task*) p;
     int s = task->im->stride;
-    int ty = task->ty;
     int tw = task->im->width / tilesz;
     image_u8_t *im = task->im;
 
+    for (int ty = task->ty0; ty < task->ty1; ty++)
     for (int tx = 0; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
 
@@ -1137,14 +1139,13 @@ void do_minmax_task(void *p)
 
 void do_blur_task(void *p)
 {
-    const int tilesz = 4;
     struct blur_task* task = (struct blur_task*) p;
-    int ty = task->ty;
-    int tw = task->im->width / tilesz;
-    int th = task->im->height / tilesz;
+    int tw = task->tw;
+    int th = task->th;
     uint8_t *im_max = task->im_max;
     uint8_t *im_min = task->im_min;
 
+    for (int ty = task->ty0; ty < task->ty1; ty++)
     for (int tx = 0; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
 
@@ -1173,8 +1174,7 @@ void do_threshold_task(void *p)
 {
     const int tilesz = 4;
     struct threshold_task* task = (struct threshold_task*) p;
-    int ty = task->ty;
-    int tw = task->im->width / tilesz;
+    int tw = task->tw;
     int s = task->im->stride;
     uint8_t *im_max = task->im_max;
     uint8_t *im_min = task->im_min;
@@ -1182,6 +1182,7 @@ void do_threshold_task(void *p)
     image_u8_t *threshim = task->threshim;
     int min_white_black_diff = task->td->qtp.min_white_black_diff;
 
+    for (int ty = task->ty0; ty < task->ty1; ty++)
     for (int tx = 0; tx < tw; tx++) {
         int min = im_min[ty*tw + tx];
         int max = im_max[ty*tw + tx];
@@ -1264,15 +1265,19 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
     uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
 
-    struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
-    // first, collect min/max statistics for each tile
-    for (int ty = 0; ty < th; ty++) {
-        minmax_tasks[ty].im = im;
-        minmax_tasks[ty].im_max = im_max;
-        minmax_tasks[ty].im_min = im_min;
-        minmax_tasks[ty].ty = ty;
+    int ntasks_target = td->nthreads;
+    int tile_chunk = (th + ntasks_target - 1) / ntasks_target;
 
-        workerpool_add_task(td->wp, do_minmax_task, &minmax_tasks[ty]);
+    struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*ntasks_target);
+    int mm_ntasks = 0;
+    for (int ty = 0; ty < th; ty += tile_chunk) {
+        minmax_tasks[mm_ntasks].im = im;
+        minmax_tasks[mm_ntasks].im_max = im_max;
+        minmax_tasks[mm_ntasks].im_min = im_min;
+        minmax_tasks[mm_ntasks].ty0 = ty;
+        minmax_tasks[mm_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+        workerpool_add_task(td->wp, do_minmax_task, &minmax_tasks[mm_ntasks]);
+        mm_ntasks++;
     }
     workerpool_run(td->wp);
     free(minmax_tasks);
@@ -1284,16 +1289,21 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         uint8_t *im_max_tmp = calloc(tw*th, sizeof(uint8_t));
         uint8_t *im_min_tmp = calloc(tw*th, sizeof(uint8_t));
 
-        struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*th);
-        for (int ty = 0; ty < th; ty++) {
-            blur_tasks[ty].im = im;
-            blur_tasks[ty].im_max = im_max;
-            blur_tasks[ty].im_min = im_min;
-            blur_tasks[ty].im_max_tmp = im_max_tmp;
-            blur_tasks[ty].im_min_tmp = im_min_tmp;
-            blur_tasks[ty].ty = ty;
+        struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*ntasks_target);
+        int blur_ntasks = 0;
+        for (int ty = 0; ty < th; ty += tile_chunk) {
+            blur_tasks[blur_ntasks].im = im;
+            blur_tasks[blur_ntasks].im_max = im_max;
+            blur_tasks[blur_ntasks].im_min = im_min;
+            blur_tasks[blur_ntasks].im_max_tmp = im_max_tmp;
+            blur_tasks[blur_ntasks].im_min_tmp = im_min_tmp;
+            blur_tasks[blur_ntasks].ty0 = ty;
+            blur_tasks[blur_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+            blur_tasks[blur_ntasks].tw = tw;
+            blur_tasks[blur_ntasks].th = th;
 
-            workerpool_add_task(td->wp, do_blur_task, &blur_tasks[ty]);
+            workerpool_add_task(td->wp, do_blur_task, &blur_tasks[blur_ntasks]);
+            blur_ntasks++;
         }
         workerpool_run(td->wp);
         free(blur_tasks);
@@ -1303,16 +1313,21 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         im_min = im_min_tmp;
     }
 
-    struct threshold_task *threshold_tasks = malloc(sizeof(struct threshold_task)*th);
-    for (int ty = 0; ty < th; ty++) {
-        threshold_tasks[ty].im = im;
-        threshold_tasks[ty].threshim = threshim;
-        threshold_tasks[ty].im_max = im_max;
-        threshold_tasks[ty].im_min = im_min;
-        threshold_tasks[ty].ty = ty;
-        threshold_tasks[ty].td = td;
+    struct threshold_task *threshold_tasks = malloc(sizeof(struct threshold_task)*ntasks_target);
+    int thresh_ntasks = 0;
+    for (int ty = 0; ty < th; ty += tile_chunk) {
+        threshold_tasks[thresh_ntasks].im = im;
+        threshold_tasks[thresh_ntasks].threshim = threshim;
+        threshold_tasks[thresh_ntasks].im_max = im_max;
+        threshold_tasks[thresh_ntasks].im_min = im_min;
+        threshold_tasks[thresh_ntasks].ty0 = ty;
+        threshold_tasks[thresh_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+        threshold_tasks[thresh_ntasks].td = td;
+        threshold_tasks[thresh_ntasks].tw = tw;
+        threshold_tasks[thresh_ntasks].th = th;
 
-        workerpool_add_task(td->wp, do_threshold_task, &threshold_tasks[ty]);
+        workerpool_add_task(td->wp, do_threshold_task, &threshold_tasks[thresh_ntasks]);
+        thresh_ntasks++;
     }
     workerpool_run(td->wp);
     free(threshold_tasks);
@@ -1529,7 +1544,7 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
         do_unionfind_first_line(uf, threshim, w, ts);
 
         int sz = h;
-        int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        int chunksize = 1 + sz / (2 * td->nthreads);
         struct unionfind_task *tasks = malloc(sizeof(struct unionfind_task)*(sz / chunksize + 1));
 
         int ntasks = 0;
@@ -1761,7 +1776,8 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
     int nclustermap = 0.2*w*h;
 
     int sz = h - 1;
-    int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int gc_tasks_per_thread = 2;
+    int chunksize = 1 + sz / (gc_tasks_per_thread * td->nthreads);
     struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
 
     int ntasks = 0;
@@ -1840,7 +1856,7 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     }
 
     int sz = zarray_size(clusters);
-    int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int chunksize = 1 + sz / (4 * td->nthreads);
     struct quad_task *tasks = malloc(sizeof(struct quad_task)*(sz / chunksize + 1));
 
     int ntasks = 0;

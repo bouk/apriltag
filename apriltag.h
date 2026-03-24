@@ -40,8 +40,6 @@ extern "C" {
 #include "common/timeprofile.h"
 #include "common/pthreads_cross.h"
 
-#define APRILTAG_TASKS_PER_THREAD_TARGET 10
-
 struct quad
 {
     float p[4][2]; // corners
