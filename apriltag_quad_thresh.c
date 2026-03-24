@@ -1693,7 +1693,8 @@ zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
     int sz = h - 1;
-    int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int gc_tasks_per_thread = 2;
+    int chunksize = 1 + sz / (gc_tasks_per_thread * td->nthreads);
     struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
 
     int ntasks = 0;
