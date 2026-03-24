@@ -1749,8 +1749,6 @@ zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
 
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
-    int nclustermap = 0.2*w*h;
-
     int sz = h - 1;
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
     struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
@@ -1766,7 +1764,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].s = ts;
         tasks[ntasks].uf = uf;
         tasks[ntasks].im = threshim;
-        tasks[ntasks].nclustermap = nclustermap/(sz / chunksize + 1);
+        tasks[ntasks].nclustermap = 1024;
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
 
         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
