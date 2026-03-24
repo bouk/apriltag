@@ -1023,10 +1023,17 @@ static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, in
         if (v == 127)
             continue;
 
-        // (dx,dy) pairs for 8 connectivity:
-        // (-1, -1)    (0, -1)    (1, -1)
-        // (-1, 0)    (REFERENCE)
-        DO_UNIONFIND2(-1, 0);
+        if (v_m1_0 == v) {
+            uint32_t left_id = y*w + x - 1;
+            uint32_t cur_id = y*w + x;
+            uint32_t left_rep = unionfind_get_representative(uf, left_id);
+            if (uf->parent[cur_id] == 0xffffffff) {
+                uf->parent[cur_id] = left_rep;
+                uf->size[left_rep]++;
+            } else {
+                unionfind_connect(uf, cur_id, left_id);
+            }
+        }
 
         if (x == 1 || !((v_m1_0 == v_m1_m1) && (v_m1_m1 == v_0_m1))) {
             DO_UNIONFIND2(0, -1);
