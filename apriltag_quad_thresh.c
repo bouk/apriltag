@@ -1465,7 +1465,8 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
         do_unionfind_first_line(uf, threshim, w, ts);
 
         int sz = h;
-        int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        int uf_tasks_per_thread = 2;
+        int chunksize = 1 + sz / (uf_tasks_per_thread * td->nthreads);
         struct unionfind_task *tasks = malloc(sizeof(struct unionfind_task)*(sz / chunksize + 1));
 
         int ntasks = 0;
