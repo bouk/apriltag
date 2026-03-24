@@ -108,7 +108,7 @@ struct cluster_task
 };
 
 struct minmax_task {
-    int ty;
+    int ty0, ty1;
 
     image_u8_t *im;
     uint8_t *im_max;
@@ -117,7 +117,7 @@ struct minmax_task {
 
 
 struct blur_threshold_task {
-    int ty;
+    int ty0, ty1;
 
     apriltag_detector_t *td;
     image_u8_t *im;
@@ -1106,10 +1106,10 @@ void do_minmax_task(void *p)
     const int tilesz = 4;
     struct minmax_task* task = (struct minmax_task*) p;
     int s = task->im->stride;
-    int ty = task->ty;
     int tw = task->im->width / tilesz;
     image_u8_t *im = task->im;
 
+    for (int ty = task->ty0; ty < task->ty1; ty++)
     for (int tx = 0; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
 
@@ -1135,7 +1135,6 @@ void do_blur_threshold_task(void *p)
 {
     const int tilesz = 4;
     struct blur_threshold_task* task = (struct blur_threshold_task*) p;
-    int ty = task->ty;
     int tw = task->tw;
     int th = task->th;
     int s = task->im->stride;
@@ -1145,6 +1144,7 @@ void do_blur_threshold_task(void *p)
     image_u8_t *threshim = task->threshim;
     int min_white_black_diff = task->td->qtp.min_white_black_diff;
 
+    for (int ty = task->ty0; ty < task->ty1; ty++)
     for (int tx = 0; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
         for (int dy = -1; dy <= 1; dy++) {
@@ -1225,32 +1225,38 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
     uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
 
-    struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
-    // first, collect min/max statistics for each tile
-    for (int ty = 0; ty < th; ty++) {
-        minmax_tasks[ty].im = im;
-        minmax_tasks[ty].im_max = im_max;
-        minmax_tasks[ty].im_min = im_min;
-        minmax_tasks[ty].ty = ty;
+    int ntasks_target = td->nthreads;
+    int tile_chunk = (th + ntasks_target - 1) / ntasks_target;
 
-        workerpool_add_task(td->wp, do_minmax_task, &minmax_tasks[ty]);
+    struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*ntasks_target);
+    int mm_ntasks = 0;
+    for (int ty = 0; ty < th; ty += tile_chunk) {
+        minmax_tasks[mm_ntasks].im = im;
+        minmax_tasks[mm_ntasks].im_max = im_max;
+        minmax_tasks[mm_ntasks].im_min = im_min;
+        minmax_tasks[mm_ntasks].ty0 = ty;
+        minmax_tasks[mm_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+        workerpool_add_task(td->wp, do_minmax_task, &minmax_tasks[mm_ntasks]);
+        mm_ntasks++;
     }
     workerpool_run(td->wp);
     free(minmax_tasks);
 
     {
-        struct blur_threshold_task *bt_tasks = malloc(sizeof(struct blur_threshold_task)*th);
-        for (int ty = 0; ty < th; ty++) {
-            bt_tasks[ty].im = im;
-            bt_tasks[ty].threshim = threshim;
-            bt_tasks[ty].im_max = im_max;
-            bt_tasks[ty].im_min = im_min;
-            bt_tasks[ty].ty = ty;
-            bt_tasks[ty].td = td;
-            bt_tasks[ty].tw = tw;
-            bt_tasks[ty].th = th;
-
-            workerpool_add_task(td->wp, do_blur_threshold_task, &bt_tasks[ty]);
+        struct blur_threshold_task *bt_tasks = malloc(sizeof(struct blur_threshold_task)*ntasks_target);
+        int bt_ntasks = 0;
+        for (int ty = 0; ty < th; ty += tile_chunk) {
+            bt_tasks[bt_ntasks].im = im;
+            bt_tasks[bt_ntasks].threshim = threshim;
+            bt_tasks[bt_ntasks].im_max = im_max;
+            bt_tasks[bt_ntasks].im_min = im_min;
+            bt_tasks[bt_ntasks].ty0 = ty;
+            bt_tasks[bt_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+            bt_tasks[bt_ntasks].td = td;
+            bt_tasks[bt_ntasks].tw = tw;
+            bt_tasks[bt_ntasks].th = th;
+            workerpool_add_task(td->wp, do_blur_threshold_task, &bt_tasks[bt_ntasks]);
+            bt_ntasks++;
         }
         workerpool_run(td->wp);
         free(bt_tasks);
