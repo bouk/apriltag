@@ -1782,7 +1782,8 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     }
 
     int sz = zarray_size(clusters);
-    int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int fq_tasks_per_thread = 4;
+    int chunksize = 1 + sz / (fq_tasks_per_thread * td->nthreads);
     struct quad_task *tasks = malloc(sizeof(struct quad_task)*(sz / chunksize + 1));
 
     int ntasks = 0;
