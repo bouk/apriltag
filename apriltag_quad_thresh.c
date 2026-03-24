@@ -1054,8 +1054,11 @@ static void do_unionfind_task2(void *p)
 {
     struct unionfind_task *task = (struct unionfind_task*) p;
 
+    unionfind_t *uf = task->uf;
+    image_u8_t *im = task->im;
+    int w = task->w, s = task->s;
     for (int y = task->y0; y < task->y1; y++) {
-        do_unionfind_line2(task->uf, task->im, task->w, task->s, y);
+        do_unionfind_line2(uf, im, w, s, y);
     }
 }
 
