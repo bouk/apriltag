@@ -63,6 +63,18 @@ static inline zarray_t *zarray_create(size_t el_sz)
     return za;
 }
 
+static inline zarray_t *zarray_create_with_capacity(size_t el_sz, int capacity)
+{
+    assert(el_sz > 0);
+
+    zarray_t *za = (zarray_t*) malloc(sizeof(zarray_t));
+    za->el_sz = el_sz;
+    za->size = 0;
+    za->alloc = capacity;
+    za->data = (char*) malloc(capacity * el_sz);
+    return za;
+}
+
 /**
  * Frees all resources associated with the variable array structure which was
  * created by zarray_create(). After calling, 'za' will no longer be valid for storage.

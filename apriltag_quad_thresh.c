@@ -1634,8 +1634,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                             mem_pool_loc++;                                 \
                                                                             \
                             entry->id = clusterid;                          \
-                            entry->cluster = zarray_create(sizeof(struct pt)); \
-                            zarray_ensure_capacity(entry->cluster, 64);     \
+                            entry->cluster = zarray_create_with_capacity(sizeof(struct pt), 64); \
                             entry->next = clustermap[clustermap_bucket];    \
                             clustermap[clustermap_bucket] = entry;          \
                         }                                                   \
@@ -1710,8 +1709,7 @@ static void do_cluster_task(void *p)
 }
 
 zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
-    zarray_t* ret = zarray_create(sizeof(struct cluster_hash*));
-    zarray_ensure_capacity(ret, zarray_size(c1) + zarray_size(c2));
+    zarray_t* ret = zarray_create_with_capacity(sizeof(struct cluster_hash*), zarray_size(c1) + zarray_size(c2));
 
     int i1 = 0;
     int i2 = 0;
@@ -1797,8 +1795,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         length = (length >> 1) + length % 2;
     }
 
-    clusters = zarray_create(sizeof(zarray_t*));
-    zarray_ensure_capacity(clusters, zarray_size(clusters_list[0]));
+    clusters = zarray_create_with_capacity(sizeof(zarray_t*), zarray_size(clusters_list[0]));
     for (int i = 0; i < zarray_size(clusters_list[0]); i++) {
         struct cluster_hash** hash;
         zarray_get_volatile(clusters_list[0], i, &hash);
