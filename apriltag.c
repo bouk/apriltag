@@ -952,16 +952,14 @@ static void quad_decode_task(void *_u)
                 double c = cos(theta), s = sin(theta);
 
                 // Fix the rotation of our homography to properly orient the tag
-                matd_t *R = matd_create(3,3);
-                MATD_EL(R, 0, 0) = c;
-                MATD_EL(R, 0, 1) = -s;
-                MATD_EL(R, 1, 0) = s;
-                MATD_EL(R, 1, 1) = c;
-                MATD_EL(R, 2, 2) = 1;
-
-                det->H = matd_op("M*M", quad_original->H, R);
-
-                matd_destroy(R);
+                // Inline H*R multiplication (R is rotation matrix [[c,-s,0],[s,c,0],[0,0,1]])
+                matd_t *qH = quad_original->H;
+                det->H = matd_create(3, 3);
+                for (int row = 0; row < 3; row++) {
+                    MATD_EL(det->H, row, 0) = MATD_EL(qH, row, 0)*c + MATD_EL(qH, row, 1)*s;
+                    MATD_EL(det->H, row, 1) = MATD_EL(qH, row, 0)*(-s) + MATD_EL(qH, row, 1)*c;
+                    MATD_EL(det->H, row, 2) = MATD_EL(qH, row, 2);
+                }
 
                 homography_project(det->H, 0, 0, &det->c[0], &det->c[1]);
 
