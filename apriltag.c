@@ -528,30 +528,23 @@ static double value_for_pixel(image_u8_t *im, double px, double py) {
 
 static void sharpen(apriltag_detector_t* td, double* values, int size) {
     double sharpened[size*size];
-    double kernel[9] = {
-        0, -1, 0,
-        -1, 4, -1,
-        0, -1, 0
-    };
 
+    // Unrolled Laplacian kernel: [0,-1,0; -1,4,-1; 0,-1,0]
     for (int y = 0; y < size; y++) {
         for (int x = 0; x < size; x++) {
-            sharpened[y*size + x] = 0;
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) {
-                    if ((y + i - 1) < 0 || (y + i - 1) > size - 1 || (x + j - 1) < 0 || (x + j - 1) > size - 1) {
-                        continue;
-                    }
-                    sharpened[y*size + x] += values[(y + i - 1)*size + (x + j - 1)]*kernel[i*3 + j];
-                }
-            }
+            double v = 4 * values[y*size + x];
+            if (y > 0)        v -= values[(y-1)*size + x];
+            if (y < size - 1) v -= values[(y+1)*size + x];
+            if (x > 0)        v -= values[y*size + x - 1];
+            if (x < size - 1) v -= values[y*size + x + 1];
+            sharpened[y*size + x] = v;
         }
     }
 
-
+    double s = td->decode_sharpening;
     for (int y = 0; y < size; y++) {
         for (int x = 0; x < size; x++) {
-            values[y*size + x] = values[y*size + x] + td->decode_sharpening*sharpened[y*size + x];
+            values[y*size + x] += s * sharpened[y*size + x];
         }
     }
 }
