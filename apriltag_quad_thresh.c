@@ -332,7 +332,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (ksz < 2)
         return 0;
 
-    double *errs = malloc(sizeof(double)*sz);
+    // Single allocation for both errs and y (low-pass filter buffer)
+    double *errs_buf = malloc(sizeof(double)*sz*2);
+    double *errs = errs_buf;
+    double *y = errs_buf + sz;
 
     for (int i = 0; i < sz; i++) {
         fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
@@ -340,7 +343,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
     // apply a low-pass filter to errs
     if (1) {
-        double *y = malloc(sizeof(double)*sz);
 
         // how much filter to apply?
 
@@ -378,7 +380,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         }
 
         memcpy(errs, y, sizeof(double)*sz);
-        free(y);
     }
 
     int *maxima = malloc(sizeof(int)*sz);
@@ -392,7 +393,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             nmaxima++;
         }
     }
-    free(errs);
+    free(errs_buf);
 
     // if we didn't get at least 4 maxima, we can't fit a quad.
     if (nmaxima < 4){
