@@ -1204,6 +1204,9 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     // Step 3. Reconcile detections--- don't report the same tag more
     // than once. (Allow non-overlapping duplicate detections.)
     if (1) {
+        // Sort by (family, id) so duplicates are adjacent, avoiding O(n^2) full scan
+        zarray_sort(detections, detection_compare_function);
+
         zarray_t *poly0 = g2d_polygon_create_zeros(4);
         zarray_t *poly1 = g2d_polygon_create_zeros(4);
 
@@ -1221,7 +1224,7 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
                 zarray_get(detections, i1, &det1);
 
                 if (det0->id != det1->id || det0->family != det1->family)
-                    continue;
+                    break;  // sorted, so no more matches possible
 
                 for (int k = 0; k < 4; k++)
                     zarray_set(poly1, k, det1->p[k], NULL);
