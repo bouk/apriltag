@@ -500,17 +500,12 @@ static int quad_update_homographies(struct quad *quad)
         matd_destroy(quad->H);
     if (quad->Hinv)
         matd_destroy(quad->Hinv);
+    quad->Hinv = NULL;
 
     // XXX Tunable
     quad->H = homography_compute2(corr_arr);
     if (quad->H != NULL) {
-        quad->Hinv = matd_inverse(quad->H);
-        if (quad->Hinv != NULL) {
-	    // Success!
-            return 0;
-        }
-        matd_destroy(quad->H);
-        quad->H = NULL;
+        return 0;
     }
     return -1;
 }
