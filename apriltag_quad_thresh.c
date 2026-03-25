@@ -360,9 +360,8 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
         fsz = 2*fsz + 1;
 
-        // For default values of cutoff = 0.05, sigma = 3,
-        // we have fsz = 17.
-        float *f = malloc(sizeof(float)*fsz);
+        // For sigma=1, cutoff=0.05: fsz = 7
+        float f[fsz];
 
         for (int i = 0; i < fsz; i++) {
             int j = i - fsz / 2;
@@ -380,7 +379,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
         memcpy(errs, y, sizeof(double)*sz);
         free(y);
-        free(f);
     }
 
     int *maxima = malloc(sizeof(int)*sz);
@@ -407,7 +405,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     int max_nmaxima = td->qtp.max_nmaxima;
 
     if (nmaxima > max_nmaxima) {
-        double *maxima_errs_copy = malloc(sizeof(double)*nmaxima);
+        double maxima_errs_copy[nmaxima];
         memcpy(maxima_errs_copy, maxima_errs, sizeof(double)*nmaxima);
 
         // throw out all but the best handful of maxima. Sorts descending.
@@ -421,7 +419,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             maxima[out++] = maxima[in];
         }
         nmaxima = out;
-        free(maxima_errs_copy);
     }
     free(maxima_errs);
 
