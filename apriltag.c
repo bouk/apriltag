@@ -702,7 +702,8 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
         }
     }
 
-    sharpen(td, values, family->total_width);
+    if (td->decode_sharpening != 0)
+        sharpen(td, values, family->total_width);
 
     uint64_t rcode = 0;
     for (uint32_t i = 0; i < family->nbits; i++) {
