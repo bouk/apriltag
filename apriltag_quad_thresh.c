@@ -1359,34 +1359,45 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     }
 
     // Handle non-full-sized tiles (right and bottom edges).
-    // These pixels use the threshold from the nearest full tile.
-    // Recompute the needed min/max for the edge tile directly from image data.
-    if (1) {
-        for (int y = 0; y < h; y++) {
-            int x0;
-            if (y >= th*tilesz)
-                x0 = 0;
-            else
-                x0 = tw*tilesz;
-
-            int ty = y / tilesz;
-            if (ty >= th) ty = th - 1;
-
-            for (int x = x0; x < w; x++) {
-                int tx = x / tilesz;
-                if (tx >= tw) tx = tw - 1;
-
-                // Recompute min/max for this tile from image data
-                uint8_t max = 0, min = 255;
-                for (int tdy = 0; tdy < tilesz && ty*tilesz+tdy < h; tdy++) {
-                    for (int tdx = 0; tdx < tilesz && tx*tilesz+tdx < w; tdx++) {
-                        uint8_t v = im->buf[(ty*tilesz+tdy)*s + tx*tilesz + tdx];
-                        if (v < min) min = v;
-                        if (v > max) max = v;
-                    }
+    // Process right edge columns (x >= tw*tilesz)
+    if (tw*tilesz < w) {
+        // Compute min/max for the last full tile column
+        for (int ty = 0; ty < th; ty++) {
+            uint8_t max = 0, min = 255;
+            int tx = tw - 1;
+            for (int tdy = 0; tdy < tilesz; tdy++) {
+                for (int tdx = 0; tdx < tilesz; tdx++) {
+                    uint8_t v = im->buf[(ty*tilesz+tdy)*s + tx*tilesz + tdx];
+                    if (v < min) min = v;
+                    if (v > max) max = v;
                 }
-
-                int thresh = min + (max - min) / 2;
+            }
+            uint8_t thresh = min + (max - min) / 2;
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                for (int x = tw*tilesz; x < w; x++) {
+                    uint8_t v = im->buf[y*s+x];
+                    threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
+                }
+            }
+        }
+    }
+    // Process bottom edge rows (y >= th*tilesz)
+    if (th*tilesz < h) {
+        for (int x = 0; x < w; x++) {
+            int tx = x / tilesz;
+            if (tx >= tw) tx = tw - 1;
+            int ty = th - 1;
+            uint8_t max = 0, min = 255;
+            for (int tdy = 0; tdy < tilesz; tdy++) {
+                for (int tdx = 0; tdx < tilesz; tdx++) {
+                    uint8_t v = im->buf[(ty*tilesz+tdy)*s + tx*tilesz + tdx];
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
+            }
+            uint8_t thresh = min + (max - min) / 2;
+            for (int y = th*tilesz; y < h; y++) {
                 uint8_t v = im->buf[y*s+x];
                 threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
             }
