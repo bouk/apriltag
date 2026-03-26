@@ -1164,10 +1164,7 @@ void do_blur_threshold_task(void *p)
         if (max - min < min_white_black_diff) {
             for (int dy = 0; dy < tilesz; dy++) {
                 int y = ty*tilesz + dy;
-                for (int dx = 0; dx < tilesz; dx++) {
-                    int x = tx*tilesz + dx;
-                    threshim->buf[y*s+x] = 127;
-                }
+                memset(&threshim->buf[y*s + tx*tilesz], 127, tilesz);
             }
             continue;
         }
