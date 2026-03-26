@@ -133,8 +133,6 @@ struct fused_threshold_task {
     apriltag_detector_t *td;
     image_u8_t *im;
     image_u8_t *threshim;
-    uint8_t *im_max;
-    uint8_t *im_min;
     int tw, th;
 };
 
@@ -1198,23 +1196,28 @@ void do_fused_threshold_task(void *p)
     int th = task->th;
     image_u8_t *im = task->im;
     image_u8_t *threshim = task->threshim;
-    uint8_t *im_max = task->im_max;
-    uint8_t *im_min = task->im_min;
     int min_white_black_diff = task->td->qtp.min_white_black_diff;
 
-    // Step 1: compute minmax for extended range
-    for (int ty = task->mm_ty0; ty < task->mm_ty1; ty++)
-    for (int tx = 0; tx < tw; tx++) {
-        uint8_t max = 0, min = 255;
-        for (int dy = 0; dy < tilesz; dy++) {
-            for (int dx = 0; dx < tilesz; dx++) {
-                uint8_t v = im->buf[(ty*tilesz+dy)*s + tx*tilesz + dx];
-                if (v < min) min = v;
-                if (v > max) max = v;
+    // Use local arrays indexed relative to mm_ty0 for better cache locality
+    int mm_rows = task->mm_ty1 - task->mm_ty0;
+    uint8_t *local_max = malloc(mm_rows * tw);
+    uint8_t *local_min = malloc(mm_rows * tw);
+
+    // Step 1: compute minmax for extended range into local arrays
+    for (int ty = task->mm_ty0; ty < task->mm_ty1; ty++) {
+        int local_row = ty - task->mm_ty0;
+        for (int tx = 0; tx < tw; tx++) {
+            uint8_t max = 0, min = 255;
+            for (int dy = 0; dy < tilesz; dy++) {
+                for (int dx = 0; dx < tilesz; dx++) {
+                    uint8_t v = im->buf[(ty*tilesz+dy)*s + tx*tilesz + dx];
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
             }
+            local_max[local_row*tw+tx] = max;
+            local_min[local_row*tw+tx] = min;
         }
-        im_max[ty*tw+tx] = max;
-        im_min[ty*tw+tx] = min;
     }
 
     // Step 2: apply blur+threshold for own range (needs 3x3 neighbor tiles)
@@ -1224,12 +1227,13 @@ void do_fused_threshold_task(void *p)
         for (int dy = -1; dy <= 1; dy++) {
             if (ty+dy < 0 || ty+dy >= th)
                 continue;
+            int local_row = ty + dy - task->mm_ty0;
             for (int dx = -1; dx <= 1; dx++) {
                 if (tx+dx < 0 || tx+dx >= tw)
                     continue;
-                uint8_t m = im_max[(ty+dy)*tw+tx+dx];
+                uint8_t m = local_max[local_row*tw+tx+dx];
                 if (m > max) max = m;
-                m = im_min[(ty+dy)*tw+tx+dx];
+                m = local_min[local_row*tw+tx+dx];
                 if (m < min) min = m;
             }
         }
@@ -1250,6 +1254,9 @@ void do_fused_threshold_task(void *p)
             }
         }
     }
+
+    free(local_max);
+    free(local_min);
 }
 
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
@@ -1291,15 +1298,12 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int tw = w / tilesz;
     int th = h / tilesz;
 
-    uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
-    uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
-
-    int ntasks_target = APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads;
+    int ntasks_target = td->nthreads;
     int tile_chunk = (th + ntasks_target - 1) / ntasks_target;
 
     // Fused minmax + blur_threshold in a single workerpool pass.
-    // Each task computes minmax for an extended tile range (±1 row border)
-    // then immediately thresholds its own tile range.
+    // Each task computes minmax into local arrays for an extended tile range
+    // (±1 row border) then immediately thresholds its own tile range.
     {
         struct fused_threshold_task *ft_tasks = malloc(sizeof(struct fused_threshold_task)*ntasks_target);
         int ft_ntasks = 0;
@@ -1307,8 +1311,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
             int ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
             ft_tasks[ft_ntasks].im = im;
             ft_tasks[ft_ntasks].threshim = threshim;
-            ft_tasks[ft_ntasks].im_max = im_max;
-            ft_tasks[ft_ntasks].im_min = im_min;
             ft_tasks[ft_ntasks].ty0 = ty;
             ft_tasks[ft_ntasks].ty1 = ty1;
             // Extend minmax range by 1 tile row on each side for 3x3 neighborhood
@@ -1324,45 +1326,40 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         free(ft_tasks);
     }
 
-    // we skipped over the non-full-sized tiles above. Fix those now.
+    // Handle non-full-sized tiles (right and bottom edges).
+    // These pixels use the threshold from the nearest full tile.
+    // Recompute the needed min/max for the edge tile directly from image data.
     if (1) {
         for (int y = 0; y < h; y++) {
-
-            // what is the first x coordinate we need to process in this row?
-
             int x0;
+            if (y >= th*tilesz)
+                x0 = 0;
+            else
+                x0 = tw*tilesz;
 
-            if (y >= th*tilesz) {
-                x0 = 0; // we're at the bottom; do the whole row.
-            } else {
-                x0 = tw*tilesz; // we only need to do the right most part.
-            }
-
-            // compute tile coordinates and clamp.
             int ty = y / tilesz;
-            if (ty >= th)
-                ty = th - 1;
+            if (ty >= th) ty = th - 1;
 
             for (int x = x0; x < w; x++) {
                 int tx = x / tilesz;
-                if (tx >= tw)
-                    tx = tw - 1;
+                if (tx >= tw) tx = tw - 1;
 
-                int max = im_max[ty*tw + tx];
-                int min = im_min[ty*tw + tx];
+                // Recompute min/max for this tile from image data
+                uint8_t max = 0, min = 255;
+                for (int tdy = 0; tdy < tilesz && ty*tilesz+tdy < h; tdy++) {
+                    for (int tdx = 0; tdx < tilesz && tx*tilesz+tdx < w; tdx++) {
+                        uint8_t v = im->buf[(ty*tilesz+tdy)*s + tx*tilesz + tdx];
+                        if (v < min) min = v;
+                        if (v > max) max = v;
+                    }
+                }
+
                 int thresh = min + (max - min) / 2;
-
                 uint8_t v = im->buf[y*s+x];
-                if (v > thresh)
-                    threshim->buf[y*s+x] = 255;
-                else
-                    threshim->buf[y*s+x] = 0;
+                threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
             }
         }
     }
-
-    free(im_min);
-    free(im_max);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
