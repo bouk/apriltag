@@ -48,10 +48,11 @@ static inline unionfind_t *unionfind_create(uint32_t maxid)
 {
     unionfind_t *uf = (unionfind_t*) calloc(1, sizeof(unionfind_t));
     uf->maxid = maxid;
-    uf->parent = (uint32_t *) malloc((maxid+1) * sizeof(uint32_t) * 2);
+    // Use calloc to get zero-filled memory (avoids explicit memset for size array)
+    uf->parent = (uint32_t *) calloc((maxid+1) * 2, sizeof(uint32_t));
     memset(uf->parent, 0xff, (maxid+1) * sizeof(uint32_t));
     uf->size = uf->parent + (maxid+1);
-    memset(uf->size, 0, (maxid+1) * sizeof(uint32_t));
+    // size array is already zero from calloc
     return uf;
 }
 
