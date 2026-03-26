@@ -130,6 +130,18 @@ struct blur_threshold_task {
     int tw, th;
 };
 
+struct fused_threshold_task {
+    int ty0, ty1;  // tile range to threshold
+    int mm_ty0, mm_ty1; // extended tile range for minmax (includes +/-1 border)
+
+    apriltag_detector_t *td;
+    image_u8_t *im;
+    image_u8_t *threshim;
+    uint8_t *im_max;
+    uint8_t *im_min;
+    int tw, th;
+};
+
 struct remove_vertex
 {
     int i;           // which vertex to remove?
@@ -1209,6 +1221,69 @@ void do_blur_threshold_task(void *p)
     }
 }
 
+void do_fused_threshold_task(void *p)
+{
+    const int tilesz = 4;
+    struct fused_threshold_task* task = (struct fused_threshold_task*) p;
+    int s = task->im->stride;
+    int tw = task->tw;
+    int th = task->th;
+    image_u8_t *im = task->im;
+    image_u8_t *threshim = task->threshim;
+    uint8_t *im_max = task->im_max;
+    uint8_t *im_min = task->im_min;
+    int min_white_black_diff = task->td->qtp.min_white_black_diff;
+
+    // Step 1: compute minmax for extended range
+    for (int ty = task->mm_ty0; ty < task->mm_ty1; ty++)
+    for (int tx = 0; tx < tw; tx++) {
+        uint8_t max = 0, min = 255;
+        for (int dy = 0; dy < tilesz; dy++) {
+            for (int dx = 0; dx < tilesz; dx++) {
+                uint8_t v = im->buf[(ty*tilesz+dy)*s + tx*tilesz + dx];
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+        im_max[ty*tw+tx] = max;
+        im_min[ty*tw+tx] = min;
+    }
+
+    // Step 2: apply blur+threshold for own range (needs 3x3 neighbor tiles)
+    for (int ty = task->ty0; ty < task->ty1; ty++)
+    for (int tx = 0; tx < tw; tx++) {
+        uint8_t max = 0, min = 255;
+        for (int dy = -1; dy <= 1; dy++) {
+            if (ty+dy < 0 || ty+dy >= th)
+                continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                if (tx+dx < 0 || tx+dx >= tw)
+                    continue;
+                uint8_t m = im_max[(ty+dy)*tw+tx+dx];
+                if (m > max) max = m;
+                m = im_min[(ty+dy)*tw+tx+dx];
+                if (m < min) min = m;
+            }
+        }
+
+        if (max - min < min_white_black_diff) {
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                memset(&threshim->buf[y*s + tx*tilesz], 127, tilesz);
+            }
+            continue;
+        }
+
+        uint8_t thresh = min + (max - min) / 2;
+        for (int dy = 0; dy < tilesz; dy++) {
+            int base = (ty*tilesz + dy)*s + tx*tilesz;
+            for (int dx = 0; dx < tilesz; dx++) {
+                threshim->buf[base + dx] = (im->buf[base + dx] > thresh) ? 255 : 0;
+            }
+        }
+    }
+}
+
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
 {
     int w = im->width, h = im->height, s = im->stride;
@@ -1254,38 +1329,31 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int ntasks_target = td->nthreads;
     int tile_chunk = (th + ntasks_target - 1) / ntasks_target;
 
-    struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*ntasks_target);
-    int mm_ntasks = 0;
-    for (int ty = 0; ty < th; ty += tile_chunk) {
-        minmax_tasks[mm_ntasks].im = im;
-        minmax_tasks[mm_ntasks].im_max = im_max;
-        minmax_tasks[mm_ntasks].im_min = im_min;
-        minmax_tasks[mm_ntasks].ty0 = ty;
-        minmax_tasks[mm_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
-        workerpool_add_task(td->wp, do_minmax_task, &minmax_tasks[mm_ntasks]);
-        mm_ntasks++;
-    }
-    workerpool_run(td->wp);
-    free(minmax_tasks);
-
+    // Fused minmax + blur_threshold in a single workerpool pass.
+    // Each task computes minmax for an extended tile range (±1 row border)
+    // then immediately thresholds its own tile range.
     {
-        struct blur_threshold_task *bt_tasks = malloc(sizeof(struct blur_threshold_task)*ntasks_target);
-        int bt_ntasks = 0;
+        struct fused_threshold_task *ft_tasks = malloc(sizeof(struct fused_threshold_task)*ntasks_target);
+        int ft_ntasks = 0;
         for (int ty = 0; ty < th; ty += tile_chunk) {
-            bt_tasks[bt_ntasks].im = im;
-            bt_tasks[bt_ntasks].threshim = threshim;
-            bt_tasks[bt_ntasks].im_max = im_max;
-            bt_tasks[bt_ntasks].im_min = im_min;
-            bt_tasks[bt_ntasks].ty0 = ty;
-            bt_tasks[bt_ntasks].ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
-            bt_tasks[bt_ntasks].td = td;
-            bt_tasks[bt_ntasks].tw = tw;
-            bt_tasks[bt_ntasks].th = th;
-            workerpool_add_task(td->wp, do_blur_threshold_task, &bt_tasks[bt_ntasks]);
-            bt_ntasks++;
+            int ty1 = (ty + tile_chunk < th) ? ty + tile_chunk : th;
+            ft_tasks[ft_ntasks].im = im;
+            ft_tasks[ft_ntasks].threshim = threshim;
+            ft_tasks[ft_ntasks].im_max = im_max;
+            ft_tasks[ft_ntasks].im_min = im_min;
+            ft_tasks[ft_ntasks].ty0 = ty;
+            ft_tasks[ft_ntasks].ty1 = ty1;
+            // Extend minmax range by 1 tile row on each side for 3x3 neighborhood
+            ft_tasks[ft_ntasks].mm_ty0 = (ty > 0) ? ty - 1 : 0;
+            ft_tasks[ft_ntasks].mm_ty1 = (ty1 < th) ? ty1 + 1 : th;
+            ft_tasks[ft_ntasks].td = td;
+            ft_tasks[ft_ntasks].tw = tw;
+            ft_tasks[ft_ntasks].th = th;
+            workerpool_add_task(td->wp, do_fused_threshold_task, &ft_tasks[ft_ntasks]);
+            ft_ntasks++;
         }
         workerpool_run(td->wp);
-        free(bt_tasks);
+        free(ft_tasks);
     }
 
     // we skipped over the non-full-sized tiles above. Fix those now.
