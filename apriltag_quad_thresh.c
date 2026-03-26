@@ -634,7 +634,7 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  * efficiently computed for any contiguous range of indices.
  */
 struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
-    struct line_fit_pt *lfps = calloc(sz, sizeof(struct line_fit_pt));
+    struct line_fit_pt *lfps = malloc(sz * sizeof(struct line_fit_pt));
     double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
 
     for (int i = 0; i < sz; i++) {
