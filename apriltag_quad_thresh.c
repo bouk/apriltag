@@ -637,11 +637,9 @@ struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
         double W = 1;
 
         if (ix > 0 && ix+1 < im->width && iy > 0 && iy+1 < im->height) {
-            int grad_x = im->buf[iy * im->stride + ix + 1] -
-                im->buf[iy * im->stride + ix - 1];
-
-            int grad_y = im->buf[(iy+1) * im->stride + ix] -
-                im->buf[(iy-1) * im->stride + ix];
+            int row = iy * im->stride;
+            int grad_x = im->buf[row + ix + 1] - im->buf[row + ix - 1];
+            int grad_y = im->buf[row + im->stride + ix] - im->buf[row - im->stride + ix];
 
             // XXX Tunable. How to shape the gradient magnitude?
             W = sqrt(grad_x*grad_x + grad_y*grad_y) + 1;
