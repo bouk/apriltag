@@ -393,6 +393,14 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     zarray_destroy(td->tag_families);
     if (td->cached_threshim)
         image_u8_destroy(td->cached_threshim);
+    if (td->cached_uf) {
+        // Manual unionfind_destroy to avoid header include
+        // unionfind_t has parent as first alloc'd member
+        typedef struct { uint32_t maxid; uint32_t *parent; uint32_t *size; } uf_t;
+        uf_t *uf = (uf_t*) td->cached_uf;
+        free(uf->parent);
+        free(uf);
+    }
     free(td);
 }
 

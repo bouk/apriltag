@@ -189,6 +189,10 @@ struct apriltag_detector
 
     // Cached threshold image buffer (reused across detect calls)
     image_u8_t *cached_threshim;
+
+    // Cached unionfind structure (reused across detect calls, typed as void* to avoid header dependency)
+    void *cached_uf;
+    uint32_t cached_uf_maxid;
 };
 
 // Represents the detection of a tag. These are returned to the user
