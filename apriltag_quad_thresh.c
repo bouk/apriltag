@@ -235,13 +235,15 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
     //}
 
     // Instead of using the above cos/sin method, pose it as an eigenvalue problem.
-    double eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+    double trace = Cxx + Cyy;
+    double disc_sq = (Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy;
+    double eig_small = 0.5*(trace - sqrtf(disc_sq));
 
     if (lineparm) {
         lineparm[0] = Ex;
         lineparm[1] = Ey;
 
-        double eig = 0.5*(Cxx + Cyy + sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+        double eig = 0.5*(trace + sqrtf(disc_sq));
         double nx1 = Cxx - eig;
         double ny1 = Cxy;
         double M1 = nx1*nx1 + ny1*ny1;
