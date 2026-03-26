@@ -1582,9 +1582,9 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     if (td->cached_uf && td->cached_uf_maxid == maxid) {
         uf = (unionfind_t*) td->cached_uf;
         td->cached_uf = NULL;
-        // Re-initialize the arrays
+        // Re-initialize parent array only; size is lazily initialized
+        // in unionfind_get_representative when parent == 0xffffffff
         memset(uf->parent, 0xff, (maxid+1) * sizeof(uint32_t));
-        memset(uf->size, 0, (maxid+1) * sizeof(uint32_t));
     } else {
         if (td->cached_uf) {
             unionfind_destroy((unionfind_t*) td->cached_uf);
