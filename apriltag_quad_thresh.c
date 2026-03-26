@@ -459,6 +459,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
                 if (fabs(dot) > max_dot)
                     continue;
 
+                // Early termination: if first two edges already exceed best, skip
+                if (err01 + err12 > best_error)
+                    continue;
+
                 for (int m3 = m2+1; m3 < nmaxima; m3++) {
                     int i3 = maxima[m3];
 
