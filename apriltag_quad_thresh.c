@@ -1620,6 +1620,11 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     int mem_pool_loc = 0;
     mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry));
 
+    // Cache for last-used cluster entry to avoid repeated hash lookups
+    // for consecutive boundary points on the same edge
+    uint64_t last_clusterid = 0;
+    struct uint64_zarray_entry *last_entry = NULL;
+
     for (int y = y0; y < y1; y++) {
         bool connected_last = false;
         for (int x = 1; x < w-1; x++) {
@@ -1657,11 +1662,15 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         else                                                \
                             clusterid = (rep0 << 32) + rep1;                \
                                                                             \
-                        /* XXX lousy hash function */                       \
                         uint32_t clustermap_bucket = u64hash_2(clusterid) % nclustermap; \
-                        struct uint64_zarray_entry *entry = clustermap[clustermap_bucket]; \
-                        while (entry && entry->id != clusterid) {           \
-                            entry = entry->next;                            \
+                        struct uint64_zarray_entry *entry;                   \
+                        if (clusterid == last_clusterid && last_entry) {    \
+                            entry = last_entry;                             \
+                        } else {                                            \
+                            entry = clustermap[clustermap_bucket];          \
+                            while (entry && entry->id != clusterid) {       \
+                                entry = entry->next;                        \
+                            }                                               \
                         }                                                   \
                                                                             \
                         if (!entry) {                                       \
@@ -1682,6 +1691,8 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                                                                             \
                         struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
                         zarray_add(entry->cluster, &p);                     \
+                        last_clusterid = clusterid;                         \
+                        last_entry = entry;                                 \
                         connected = true;                                   \
                     }                                                   \
                 }                                                       \
