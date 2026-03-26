@@ -1190,11 +1190,9 @@ void do_blur_threshold_task(void *p)
 
         uint8_t thresh = min + (max - min) / 2;
         for (int dy = 0; dy < tilesz; dy++) {
-            int y = ty*tilesz + dy;
+            int base = (ty*tilesz + dy)*s + tx*tilesz;
             for (int dx = 0; dx < tilesz; dx++) {
-                int x = tx*tilesz + dx;
-                uint8_t v = im->buf[y*s+x];
-                threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
+                threshim->buf[base + dx] = (im->buf[base + dx] > thresh) ? 255 : 0;
             }
         }
     }
