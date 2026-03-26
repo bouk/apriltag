@@ -815,6 +815,15 @@ int fit_quad(
         return 0;
     }
 
+    // Reject clusters with extreme aspect ratios (> 4:1) - not quad-like
+    {
+        int w = xmax - xmin;
+        int h = ymax - ymin;
+        if (w > 4*h || h > 4*w) {
+            return 0;
+        }
+    }
+
     // add some noise to (cx,cy) so that pixels get a more diverse set
     // of theta estimates. This will help us remove more points.
     // (Only helps a small amount. The actual noise values here don't
