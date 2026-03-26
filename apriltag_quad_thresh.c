@@ -1630,7 +1630,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
         for (int x = 1; x < w-1; x++) {
 
             uint8_t v0 = threshim->buf[y*ts + x];
-            if (v0 == 127) {
+            if (__builtin_expect(v0 == 127, 0)) {
                 connected_last = false;
                 continue;
             }
