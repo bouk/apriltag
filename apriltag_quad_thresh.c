@@ -1526,32 +1526,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 continue;
             }
 
-            // XXX don't query this until we know we need it?
-            uint64_t rep0 = unionfind_get_representative(uf, y*w + x);
-            if ((int)unionfind_get_set_size(uf, rep0) < min_cluster_pixels) {
-                connected_last = false;
-                continue;
-            }
-
-            // whenever we find two adjacent pixels such that one is
-            // white and the other black, we add the point half-way
-            // between them to a cluster associated with the unique
-            // ids of the white and black regions.
-            //
-            // We additionally compute the gradient direction (i.e., which
-            // direction was the white pixel?) Note: if (v1-v0) == 255, then
-            // (dx,dy) points towards the white pixel. if (v1-v0) == -255, then
-            // (dx,dy) points towards the black pixel. p.gx and p.gy will thus
-            // be -255, 0, or 255.
-            //
-            // Note that any given pixel might be added to multiple
-            // different clusters. But in the common case, a given
-            // pixel will be added multiple times to the same cluster,
-            // which increases the size of the cluster and thus the
-            // computational costs.
-            //
-            // A possible optimization would be to combine entries
-            // within the same cluster.
+            // Defer rep0 lookup until we know there's a boundary.
+            // Most pixels are interior (same color as all neighbors).
+            uint64_t rep0 = 0;
+            bool rep0_valid = false;
 
             bool connected;
 #define DO_CONN(dx, dy)                                                 \
@@ -1559,6 +1537,14 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 uint8_t v1 = threshim->buf[(y + dy)*ts + x + dx];       \
                                                                         \
                 if (v0 + v1 == 255) {                                   \
+                    if (!rep0_valid) {                                   \
+                        rep0 = unionfind_get_representative(uf, y*w + x); \
+                        if ((int)unionfind_get_set_size(uf, rep0) < min_cluster_pixels) { \
+                            connected_last = false;                     \
+                            goto next_pixel;                            \
+                        }                                               \
+                        rep0_valid = true;                              \
+                    }                                                   \
                     uint64_t rep1 = unionfind_get_representative(uf, (y + dy)*w + x + dx); \
                     if ((int)unionfind_get_set_size(uf, rep1) >= min_cluster_pixels) { \
                         uint64_t clusterid;                                 \
@@ -1612,6 +1598,9 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
             connected = false;
             DO_CONN(1, 1);
             connected_last = connected;
+            if (!rep0_valid)
+                connected_last = false;
+          next_pixel: ;
         }
     }
 #undef DO_CONN
