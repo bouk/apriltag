@@ -1056,7 +1056,18 @@ static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, in
         }
 
         if (x == 1 || !((v_m1_0 == v_m1_m1) && (v_m1_m1 == v_0_m1))) {
-            DO_UNIONFIND2(0, -1);
+            if (v_0_m1 == v) {
+                uint32_t cur_id = y*w + x;
+                uint32_t up_id = (y-1)*w + x;
+                if (uf->parent[cur_id] == 0xffffffff) {
+                    // Fast path: current pixel not yet connected, connect to up neighbor
+                    uint32_t up_rep = unionfind_get_representative(uf, up_id);
+                    uf->parent[cur_id] = up_rep;
+                    uf->size[up_rep]++;
+                } else {
+                    unionfind_connect(uf, cur_id, up_id);
+                }
+            }
         }
 
         if (v == 255) {
