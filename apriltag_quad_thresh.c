@@ -1704,7 +1704,7 @@ zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
 
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
-    int nclustermap = 0.2*w*h;
+    int nclustermap = 0.01*w*h;
 
     int sz = h - 1;
     int gc_tasks_per_thread = 2;
