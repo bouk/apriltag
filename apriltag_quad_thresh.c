@@ -52,7 +52,10 @@ static inline long int random(void)
 #endif
 
 static inline uint32_t u64hash_2(uint64_t x) {
-    return (2654435761 * x) >> 32;
+    // splitmix64-inspired hash for better distribution
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return (uint32_t)(x >> 32);
 }
 
 struct uint64_zarray_entry
