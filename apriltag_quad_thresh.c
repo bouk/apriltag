@@ -1297,7 +1297,19 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     assert(w < 32768);
     assert(h < 32768);
 
-    image_u8_t *threshim = image_u8_create_alignment(w, h, s);
+    // Reuse cached threshold image if dimensions match
+    image_u8_t *threshim;
+    if (td->cached_threshim && td->cached_threshim->width == w &&
+        td->cached_threshim->height == h && td->cached_threshim->stride == s) {
+        threshim = td->cached_threshim;
+        td->cached_threshim = NULL;
+    } else {
+        if (td->cached_threshim) {
+            image_u8_destroy(td->cached_threshim);
+            td->cached_threshim = NULL;
+        }
+        threshim = image_u8_create_alignment(w, h, s);
+    }
     assert(threshim->stride == s);
 
     // The idea is to find the maximum and minimum values in a
@@ -2011,7 +2023,10 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     }
 
 
-    image_u8_destroy(threshim);
+    // Cache threshim for reuse instead of destroying
+    if (td->cached_threshim)
+        image_u8_destroy(td->cached_threshim);
+    td->cached_threshim = threshim;
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////

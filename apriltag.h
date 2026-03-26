@@ -186,6 +186,9 @@ struct apriltag_detector
 
     // Used for thread safety.
     pthread_mutex_t mutex;
+
+    // Cached threshold image buffer (reused across detect calls)
+    image_u8_t *cached_threshim;
 };
 
 // Represents the detection of a tag. These are returned to the user
