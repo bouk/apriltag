@@ -448,6 +448,9 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             if (mse01 > td->qtp.max_line_fit_mse)
                 continue;
 
+            if (err01 > best_error)
+                continue;
+
             for (int m2 = m1+1; m2 < nmaxima - 1; m2++) {
                 int i2 = maxima[m2];
 
