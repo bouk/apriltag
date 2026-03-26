@@ -669,7 +669,7 @@ struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
 static inline void ptsort(struct pt *pts, int sz)
 {
 #define MAYBE_SWAP(arr,apos,bpos)                                   \
-    if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
+    if (arr[apos].slope > arr[bpos].slope) {                        \
         tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp;    \
     };
 
@@ -743,7 +743,7 @@ static inline void ptsort(struct pt *pts, int sz)
     ptsort(bs, bsz);
 
     #define MERGE(apos,bpos)                        \
-    if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
+    if (as[apos].slope < bs[bpos].slope)        \
         pts[outpos++] = as[apos++];             \
     else                                        \
         pts[outpos++] = bs[bpos++];
