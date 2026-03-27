@@ -1514,11 +1514,11 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts) {
     uint32_t maxid = w * h;
     if (td->cached_uf) {
-      if (td->cached_uf->maxid <= maxid) {
-        unionfind_reset(td->cached_uf);
-      } else {
-        unionfind_resize(td->cached_uf, maxid);
-      }
+        if (td->cached_uf->maxid >= maxid) {
+            unionfind_reset(td->cached_uf);
+        } else {
+            unionfind_resize(td->cached_uf, maxid);
+        }
     } else {
         td->cached_uf = unionfind_create(maxid);
     }
