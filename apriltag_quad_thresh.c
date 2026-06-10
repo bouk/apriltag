@@ -167,6 +167,51 @@ struct cluster_hash
     zarray_t* data;
 };
 
+// scratch buffers reused across all clusters processed by one quad task,
+// so fit_quad doesn't malloc/free per cluster.
+struct quad_fit_scratch
+{
+    int capacity; // in points
+    struct line_fit_pt *lfps;
+    double *errs;
+    double *yfilt;
+    int *maxima;
+    double *maxima_errs;
+    struct pt *pt_tmp;
+};
+
+static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
+{
+    if (sz <= scratch->capacity)
+        return;
+    int cap = scratch->capacity ? 2*scratch->capacity : 1024;
+    if (cap < sz)
+        cap = sz;
+    free(scratch->lfps);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->pt_tmp);
+    scratch->lfps = malloc(sizeof(struct line_fit_pt)*cap);
+    scratch->errs = malloc(sizeof(double)*cap);
+    scratch->yfilt = malloc(sizeof(double)*cap);
+    scratch->maxima = malloc(sizeof(int)*cap);
+    scratch->maxima_errs = malloc(sizeof(double)*cap);
+    scratch->pt_tmp = malloc(sizeof(struct pt)*cap);
+    scratch->capacity = cap;
+}
+
+static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
+{
+    free(scratch->lfps);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->pt_tmp);
+}
+
 
 // lfps contains *cumulative* moments for N points, with
 // index j reflecting points [0,j] (inclusive).
@@ -348,7 +393,8 @@ static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, in
 static __thread float qsm_kernel[QSM_FSZ];
 static __thread bool qsm_kernel_init;
 
-int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4],
+                        struct quad_fit_scratch *scratch)
 {
     int sz = zarray_size(cluster);
 
@@ -369,7 +415,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (ksz < 2)
         return 0;
 
-    double *errs = malloc(sizeof(double)*sz);
+    double *errs = scratch->errs;
 
     for (int i = 0; i < sz; i++) {
         int i0 = i - ksz;
@@ -383,7 +429,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
     // apply a low-pass filter to errs
     if (1) {
-        double *y = malloc(sizeof(double)*sz);
+        double *y = scratch->yfilt;
 
         if (!qsm_kernel_init) {
             double sigma = 1; // was 3
@@ -414,11 +460,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         }
 
         memcpy(errs, y, sizeof(double)*sz);
-        free(y);
     }
 
-    int *maxima = malloc(sizeof(int)*sz);
-    double *maxima_errs = malloc(sizeof(double)*sz);
+    int *maxima = scratch->maxima;
+    double *maxima_errs = scratch->maxima_errs;
     int nmaxima = 0;
 
     for (int i = 0; i < sz; i++) {
@@ -429,14 +474,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             nmaxima++;
         }
     }
-    free(errs);
 
     // if we didn't get at least 4 maxima, we can't fit a quad.
-    if (nmaxima < 4){
-        free(maxima);
-        free(maxima_errs);
+    if (nmaxima < 4)
         return 0;
-    }
 
     // select only the best maxima if we have too many
     int max_nmaxima = td->qtp.max_nmaxima;
@@ -458,7 +499,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         nmaxima = out;
         free(maxima_errs_copy);
     }
-    free(maxima_errs);
 
     int best_indices[4];
     double best_error = HUGE_VALF;
@@ -644,8 +684,7 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  * Compute statistics that allow line fit queries to be
  * efficiently computed for any contiguous range of indices.
  */
-struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
-    struct line_fit_pt *lfps = calloc(sz, sizeof(struct line_fit_pt));
+void compute_lfps(int sz, zarray_t* cluster, image_u8_t* im, struct line_fit_pt *lfps) {
     double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
 
     for (int i = 0; i < sz; i++) {
@@ -686,7 +725,6 @@ struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
         lfps[i].Myy = sum_Myy;
         lfps[i].W = sum_W;
     }
-    return lfps;
 }
 
 static inline void ptsort(struct pt *pts, int sz)
@@ -801,7 +839,8 @@ int fit_quad(
         struct quad *quad,
         int tag_width,
         bool normal_border,
-        bool reversed_border) {
+        bool reversed_border,
+        struct quad_fit_scratch *scratch) {
     int res = 0;
 
     /////////////////////////////////////////////////////////////
@@ -882,18 +921,21 @@ int fit_quad(
         return 0;
     }
 
+    int sz = zarray_size(cluster);
+    quad_fit_scratch_ensure(scratch, sz);
+
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        ptsort((struct pt*) cluster->data, zarray_size(cluster));
+        ptsort((struct pt*) cluster->data, sz);
     }
 
-    int sz = zarray_size(cluster);
-    struct line_fit_pt *lfps = compute_lfps(sz, cluster, im);
+    struct line_fit_pt *lfps = scratch->lfps;
+    compute_lfps(sz, cluster, im, lfps);
 
     int indices[4];
     if (1) {
-        if (!quad_segment_maxima(td, cluster, lfps, indices))
+        if (!quad_segment_maxima(td, cluster, lfps, indices, scratch))
             goto finish;
     } else {
         if (!quad_segment_agg(cluster, lfps, indices))
@@ -1015,8 +1057,6 @@ int fit_quad(
 
   finish:
 
-    free(lfps);
-
     return res;
 }
 
@@ -1096,6 +1136,9 @@ static void do_quad_task(void *p)
     apriltag_detector_t *td = task->td;
     int w = task->w, h = task->h;
 
+    struct quad_fit_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
         zarray_t **cluster;
@@ -1117,12 +1160,14 @@ static void do_quad_task(void *p)
         struct quad quad;
         memset(&quad, 0, sizeof(struct quad));
 
-        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border)) {
+        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
             pthread_mutex_lock(&td->mutex);
             zarray_add(quads, &quad);
             pthread_mutex_unlock(&td->mutex);
         }
     }
+
+    quad_fit_scratch_free(&scratch);
 }
 
 void do_minmax_task(void *p)
