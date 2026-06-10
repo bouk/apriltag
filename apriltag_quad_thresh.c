@@ -1716,11 +1716,11 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 if (v0 + v1 == 255) {                                   \
                     if (rep0_state == 0) {                              \
                         rep0 = unionfind_get_representative(uf, y*w + x); \
-                        rep0_state = ((int)unionfind_get_set_size(uf, rep0) >= min_cluster_pixels) ? 1 : 2; \
+                        rep0_state = ((int)(uf->size[rep0] + 1) >= min_cluster_pixels) ? 1 : 2; \
                     }                                                   \
                     if (rep0_state == 1) {                              \
                     uint64_t rep1 = unionfind_get_representative(uf, (y + dy)*w + x + dx); \
-                    if ((int)unionfind_get_set_size(uf, rep1) >= min_cluster_pixels) { \
+                    if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) { \
                         uint64_t clusterid;                                 \
                         if (rep0 < rep1)                                    \
                             clusterid = (rep1 << 32) + rep0;                \
