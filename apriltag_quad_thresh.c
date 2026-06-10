@@ -592,7 +592,47 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
         }
 
         // sz >= 12*ksz >= 24 > QSM_FSZ, so single wrap adjustments suffice
-        for (int iy = 0; iy < sz; iy++) {
+        int iy = 0;
+
+#ifdef __AVX2__
+        // middle outputs need no wrap handling; 4 outputs per iteration
+        // with the same per-output tap order as the scalar code
+        {
+            __m256d k0 = _mm256_set1_pd(qsm_kernel[0]);
+            __m256d k1 = _mm256_set1_pd(qsm_kernel[1]);
+            __m256d k2 = _mm256_set1_pd(qsm_kernel[2]);
+            __m256d k3 = _mm256_set1_pd(qsm_kernel[3]);
+            __m256d k4 = _mm256_set1_pd(qsm_kernel[4]);
+            __m256d k5 = _mm256_set1_pd(qsm_kernel[5]);
+            __m256d k6 = _mm256_set1_pd(qsm_kernel[6]);
+
+            for (iy = QSM_FSZ/2; iy + 4 <= sz - QSM_FSZ/2; iy += 4) {
+                const double *base = &errs[iy - QSM_FSZ/2];
+                __m256d acc = _mm256_mul_pd(_mm256_loadu_pd(base), k0);
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 1), k1));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 2), k2));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 3), k3));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 4), k4));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 5), k5));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 6), k6));
+                _mm256_storeu_pd(&y[iy], acc);
+            }
+            // the scalar loop below covers [0, QSM_FSZ/2), the vector tail,
+            // and the wrapped end region
+            for (int e = 0; e < QSM_FSZ/2; e++) {
+                int j = e - QSM_FSZ / 2 + sz;
+                double acc = 0;
+                for (int i = 0; i < QSM_FSZ; i++) {
+                    acc += errs[j] * qsm_kernel[i];
+                    if (++j == sz)
+                        j = 0;
+                }
+                y[e] = acc;
+            }
+        }
+#endif
+
+        for (; iy < sz; iy++) {
             double acc = 0;
 
             int j = iy - QSM_FSZ / 2;
