@@ -1661,7 +1661,8 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     uint32_t bucket_mask = (uint32_t)nclustermap - 1;
 
     int mem_chunk_size = 2048;
-    struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*(1 + 2 * nclustermap / mem_chunk_size)); // SmodeTech: avoid memory corruption when nclustermap < mem_chunk_size
+    int mem_pools_capacity = 16;
+    struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*mem_pools_capacity);
     int mem_pool_idx = 0;
     int mem_pool_loc = 0;
     mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry));
@@ -1728,6 +1729,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                             if (mem_pool_loc == mem_chunk_size) {           \
                                 mem_pool_loc = 0;                           \
                                 mem_pool_idx++;                             \
+                                if (mem_pool_idx == mem_pools_capacity) {   \
+                                    mem_pools_capacity *= 2;                \
+                                    mem_pools = realloc(mem_pools, sizeof(struct uint64_zarray_entry *)*mem_pools_capacity); \
+                                }                                           \
                                 mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry)); \
                             }                                               \
                             entry = mem_pools[mem_pool_idx] + mem_pool_loc; \
