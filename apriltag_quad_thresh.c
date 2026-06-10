@@ -509,7 +509,44 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
     {
         const double *aMx = lfps->Mx, *aMy = lfps->My, *aMxx = lfps->Mxx;
         const double *aMxy = lfps->Mxy, *aMyy = lfps->Myy, *aW = lfps->W;
-        for (int i = mid_lo; i <= mid_hi; i++) {
+        int i = mid_lo;
+
+#ifdef __AVX2__
+        // 4 windows per iteration; the SoA loads are contiguous and every
+        // step is a single exact-rounded operation, including the
+        // double->float->sqrtf->double sequence of the scalar code
+        const __m256d half = _mm256_set1_pd(0.5);
+        const __m256d four = _mm256_set1_pd(4.0);
+        const __m256d vN = _mm256_set1_pd((double)N);
+        for (; i + 4 <= mid_hi + 1; i += 4) {
+            int u = i + ksz, l = i - ksz - 1;
+
+            __m256d Mx  = _mm256_sub_pd(_mm256_loadu_pd(&aMx[u]),  _mm256_loadu_pd(&aMx[l]));
+            __m256d My  = _mm256_sub_pd(_mm256_loadu_pd(&aMy[u]),  _mm256_loadu_pd(&aMy[l]));
+            __m256d Mxx = _mm256_sub_pd(_mm256_loadu_pd(&aMxx[u]), _mm256_loadu_pd(&aMxx[l]));
+            __m256d Mxy = _mm256_sub_pd(_mm256_loadu_pd(&aMxy[u]), _mm256_loadu_pd(&aMxy[l]));
+            __m256d Myy = _mm256_sub_pd(_mm256_loadu_pd(&aMyy[u]), _mm256_loadu_pd(&aMyy[l]));
+            __m256d W   = _mm256_sub_pd(_mm256_loadu_pd(&aW[u]),   _mm256_loadu_pd(&aW[l]));
+
+            __m256d Ex = _mm256_div_pd(Mx, W);
+            __m256d Ey = _mm256_div_pd(My, W);
+            __m256d Cxx = _mm256_sub_pd(_mm256_div_pd(Mxx, W), _mm256_mul_pd(Ex, Ex));
+            __m256d Cxy = _mm256_sub_pd(_mm256_div_pd(Mxy, W), _mm256_mul_pd(Ex, Ey));
+            __m256d Cyy = _mm256_sub_pd(_mm256_div_pd(Myy, W), _mm256_mul_pd(Ey, Ey));
+
+            __m256d d = _mm256_sub_pd(Cxx, Cyy);
+            __m256d rad = _mm256_add_pd(_mm256_mul_pd(d, d),
+                                        _mm256_mul_pd(four, _mm256_mul_pd(Cxy, Cxy)));
+            // sqrtf semantics: round to float, sqrt in float, widen back
+            __m256d root = _mm256_cvtps_pd(_mm_sqrt_ps(_mm256_cvtpd_ps(rad)));
+
+            __m256d eig = _mm256_mul_pd(half,
+                          _mm256_sub_pd(_mm256_add_pd(Cxx, Cyy), root));
+            _mm256_storeu_pd(&errs[i], _mm256_mul_pd(vN, eig));
+        }
+#endif
+
+        for (; i <= mid_hi; i++) {
             int u = i + ksz, l = i - ksz - 1;
 
             double Mx  = aMx[u]  - aMx[l];
