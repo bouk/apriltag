@@ -2495,11 +2495,21 @@ struct run_rep
     int8_t state; // 0 = unknown, 1 = usable, 2 = component too small
 };
 
+// Read-only find: the union-find is complete by the time clustering runs,
+// so skip path halving -- its writes to the small shared arrays would just
+// ping-pong cache lines between the cluster tasks.
+static inline uint32_t unionfind_representative_ro(const unionfind_t *uf, uint32_t id)
+{
+    while (uf->parent[id] != id)
+        id = uf->parent[id];
+    return id;
+}
+
 static inline int run_usable(unionfind_t *uf, uint32_t base, struct run_rep *cache, int idx,
                              int min_cluster_pixels, uint32_t *rep_out)
 {
     if (cache[idx].state == 0) {
-        uint32_t rep = unionfind_get_representative(uf, base + idx);
+        uint32_t rep = unionfind_representative_ro(uf, base + idx);
         cache[idx].rep = rep;
         cache[idx].state = ((int)(uf->size[rep] + 1) >= min_cluster_pixels) ? 1 : 2;
     }
@@ -2588,7 +2598,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         if (ia + 1 < na && runs_a[ia+1].start == a1 + 1) { \
                             ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1); \
                         } else { \
-                            rep1 = unionfind_get_representative(uf, vcol_base + y); \
+                            rep1 = unionfind_representative_ro(uf, vcol_base + y); \
                             ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels; \
                         } \
                         if (ok) \
@@ -2725,7 +2735,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                     if (v0 + v1 == 255) {
                         RESOLVE_A();
                         if (rep0_state == 1) {
-                            uint32_t rep1 = unionfind_get_representative(uf, vcol_base + (y+1));
+                            uint32_t rep1 = unionfind_representative_ro(uf, vcol_base + (y+1));
                             if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
                                 gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y + 1, vdiff, vdiff);
                                 fired11_at_a1 = true;
