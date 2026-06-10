@@ -1774,7 +1774,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
         int start = zarray_size(clusters);
         for (struct uint64_zarray_entry *entry = clustermap[i]; entry; entry = entry->next) {
             struct cluster_hash* cluster_hash = malloc(sizeof(struct cluster_hash));
-            cluster_hash->hash = u64hash_2(entry->id) % nclustermap;
+            cluster_hash->hash = i; // == u64hash_2(entry->id) & bucket_mask
             cluster_hash->id = entry->id;
             cluster_hash->data = entry->cluster;
             zarray_add(clusters, &cluster_hash);
