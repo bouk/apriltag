@@ -402,7 +402,7 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
         *mse = eig_small;
 }
 
-float pt_compare_angle(struct pt *a, struct pt *b) {
+static inline float pt_compare_angle(struct pt *a, struct pt *b) {
     return a->slope - b->slope;
 }
 
