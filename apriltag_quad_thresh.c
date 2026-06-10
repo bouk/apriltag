@@ -231,7 +231,6 @@ struct quad_fit_scratch
     double *yfilt;
     int *maxima;
     double *maxima_errs;
-    struct pt *pt_tmp;
     uint64_t *sort_keys;
     uint64_t *sort_tmp;
 };
@@ -248,7 +247,6 @@ static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
     free(scratch->yfilt);
     free(scratch->maxima);
     free(scratch->maxima_errs);
-    free(scratch->pt_tmp);
     free(scratch->sort_keys);
     free(scratch->sort_tmp);
     scratch->lfps = malloc(sizeof(struct line_fit_pt)*cap);
@@ -256,7 +254,6 @@ static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
     scratch->yfilt = malloc(sizeof(double)*cap);
     scratch->maxima = malloc(sizeof(int)*cap);
     scratch->maxima_errs = malloc(sizeof(double)*cap);
-    scratch->pt_tmp = malloc(sizeof(struct pt)*cap);
     scratch->sort_keys = malloc(sizeof(uint64_t)*cap);
     scratch->sort_tmp = malloc(sizeof(uint64_t)*cap);
     scratch->capacity = cap;
@@ -269,7 +266,6 @@ static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
     free(scratch->yfilt);
     free(scratch->maxima);
     free(scratch->maxima_errs);
-    free(scratch->pt_tmp);
     free(scratch->sort_keys);
     free(scratch->sort_tmp);
 }
@@ -774,12 +770,14 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  * Compute statistics that allow line fit queries to be
  * efficiently computed for any contiguous range of indices.
  */
-void compute_lfps(int sz, zarray_t* cluster, image_u8_t* im, struct line_fit_pt *lfps) {
+// Accumulate the cumulative line-fit moments in angle-sorted order: entry i
+// covers the points whose sort keys are keys[0..i] (the low key word holds
+// the complemented index into pts).
+void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, struct line_fit_pt *lfps) {
     double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
 
     for (int i = 0; i < sz; i++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, i, &p);
+        struct pt *p = &pts[~(uint32_t)keys[i]];
 
         // we now undo our fixed-point arithmetic.
         double delta = 0.5; // adjust for pixel center bias
@@ -949,19 +947,15 @@ static void keysort_move(uint64_t *A, uint64_t *B, int sz)
     key_merge(A, asz, A + asz, bsz, B);
 }
 
-// sort pts by the keys already built in scratch->sort_keys
-static void pt_key_sort(struct pt *pts, int sz, struct quad_fit_scratch *scratch)
+// Sort the keys in scratch->sort_keys. The point array itself is left
+// untouched: the only consumer of the sorted order is compute_lfps, which
+// reads points through the key indices.
+static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
 {
     if (sz < 2)
         return;
 
-    uint64_t *keys = scratch->sort_keys;
-    keysort_in_place(keys, scratch->sort_tmp, sz);
-
-    struct pt *tmp = scratch->pt_tmp;
-    for (int i = 0; i < sz; i++)
-        tmp[i] = pts[~(uint32_t)keys[i]];
-    memcpy(pts, tmp, sizeof(struct pt)*sz);
+    keysort_in_place(scratch->sort_keys, scratch->sort_tmp, sz);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
@@ -1065,11 +1059,11 @@ int fit_quad(
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        pt_key_sort(pts, sz, scratch);
+        pt_key_sort(sz, scratch);
     }
 
     struct line_fit_pt *lfps = scratch->lfps;
-    compute_lfps(sz, cluster, im, lfps);
+    compute_lfps(sz, pts, keys, im, lfps);
 
     int indices[4];
     if (1) {
