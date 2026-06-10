@@ -1552,7 +1552,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     assert(w < 32768);
     assert(h < 32768);
 
-    image_u8_t *threshim = image_u8_create_alignment(w, h, s);
+    if (td->cached_threshim && (td->cached_threshim->width != w ||
+                                td->cached_threshim->height != h ||
+                                td->cached_threshim->stride != s)) {
+        image_u8_destroy(td->cached_threshim);
+        td->cached_threshim = NULL;
+    }
+    if (!td->cached_threshim)
+        td->cached_threshim = image_u8_create_alignment(w, h, s);
+    image_u8_t *threshim = td->cached_threshim;
     assert(threshim->stride == s);
 
     // The idea is to find the maximum and minimum values in a
@@ -1585,8 +1593,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int tw = w / tilesz;
     int th = h / tilesz;
 
-    uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
-    uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
+    // tile min/max scratch (4 arrays: min, max, and their blur outputs),
+    // reused across detect calls; every entry is written before being read
+    if (td->cached_tile_bufs_size < 4*tw*th) {
+        free(td->cached_tile_bufs);
+        td->cached_tile_bufs = malloc(4*tw*th);
+        td->cached_tile_bufs_size = 4*tw*th;
+    }
+    uint8_t *im_max = td->cached_tile_bufs;
+    uint8_t *im_min = td->cached_tile_bufs + tw*th;
 
     struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
     // first, collect min/max statistics for each tile
@@ -1605,8 +1620,8 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // over larger areas. This reduces artifacts due to abrupt changes
     // in the threshold value.
     if (1) {
-        uint8_t *im_max_tmp = calloc(tw*th, sizeof(uint8_t));
-        uint8_t *im_min_tmp = calloc(tw*th, sizeof(uint8_t));
+        uint8_t *im_max_tmp = td->cached_tile_bufs + 2*tw*th;
+        uint8_t *im_min_tmp = td->cached_tile_bufs + 3*tw*th;
 
         struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*th);
         for (int ty = 0; ty < th; ty++) {
@@ -1621,8 +1636,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
         workerpool_run(td->wp);
         free(blur_tasks);
-        free(im_max);
-        free(im_min);
         im_max = im_max_tmp;
         im_min = im_min_tmp;
     }
@@ -1678,8 +1691,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
     }
 
-    free(im_min);
-    free(im_max);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
@@ -2514,7 +2525,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     }
 
 
-    image_u8_destroy(threshim);
+    // threshim is cached on the detector and reused next frame
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////
