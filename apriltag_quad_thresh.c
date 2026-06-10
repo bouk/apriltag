@@ -341,6 +341,13 @@ static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, in
     return pf;
 }
 
+// Gaussian low-pass kernel for the per-point fit errors. sigma = 1,
+// cutoff = 0.05 give a fixed size of 7; values match
+// exp(-j*j/(2*sigma*sigma)) for j in [-3, 3].
+#define QSM_FSZ 7
+static __thread float qsm_kernel[QSM_FSZ];
+static __thread bool qsm_kernel_init;
+
 int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
 {
     int sz = zarray_size(cluster);
@@ -372,45 +379,30 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (1) {
         double *y = malloc(sizeof(double)*sz);
 
-        // how much filter to apply?
-
-        // XXX Tunable
-        double sigma = 1; // was 3
-
-        // cutoff = exp(-j*j/(2*sigma*sigma));
-        // log(cutoff) = -j*j / (2*sigma*sigma)
-        // log(cutoff)*2*sigma*sigma = -j*j;
-
-        // how big a filter should we use? We make our kernel big
-        // enough such that we represent any values larger than
-        // 'cutoff'.
-
-        // XXX Tunable (though not super useful to change)
-        double cutoff = 0.05;
-        int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
-        fsz = 2*fsz + 1;
-
-        // For default values of cutoff = 0.05, sigma = 3,
-        // we have fsz = 17.
-        float *f = malloc(sizeof(float)*fsz);
-
-        for (int i = 0; i < fsz; i++) {
-            int j = i - fsz / 2;
-            f[i] = exp(-j*j/(2*sigma*sigma));
+        if (!qsm_kernel_init) {
+            double sigma = 1; // was 3
+            double cutoff = 0.05;
+            int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
+            fsz = 2*fsz + 1;
+            assert(fsz == QSM_FSZ);
+            for (int i = 0; i < fsz; i++) {
+                int j = i - fsz / 2;
+                qsm_kernel[i] = exp(-j*j/(2*sigma*sigma));
+            }
+            qsm_kernel_init = true;
         }
 
         for (int iy = 0; iy < sz; iy++) {
             double acc = 0;
 
-            for (int i = 0; i < fsz; i++) {
-                acc += errs[(iy + i - fsz / 2 + sz) % sz] * f[i];
+            for (int i = 0; i < QSM_FSZ; i++) {
+                acc += errs[(iy + i - QSM_FSZ / 2 + sz) % sz] * qsm_kernel[i];
             }
             y[iy] = acc;
         }
 
         memcpy(errs, y, sizeof(double)*sz);
         free(y);
-        free(f);
     }
 
     int *maxima = malloc(sizeof(int)*sz);
