@@ -321,6 +321,26 @@ int err_compare_descending(const void *_a, const void *_b)
   rather than pairs of clusters.) Critically, this helps keep nearby
   edges from becoming connected.
 */
+// memoized fit_line over pairs of maxima; the candidate-quad search asks
+// for the same segment fit many times across its nested loops.
+struct pair_fit
+{
+    double err, mse;
+    double params[4];
+    bool computed;
+};
+
+static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, int *maxima, int nmaxima,
+                                            struct pair_fit *memo, int ma, int mb)
+{
+    struct pair_fit *pf = &memo[ma*nmaxima + mb];
+    if (!pf->computed) {
+        fit_line(lfps, sz, maxima[ma], maxima[mb], pf->params, &pf->err, &pf->mse);
+        pf->computed = true;
+    }
+    return pf;
+}
+
 int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
 {
     int sz = zarray_size(cluster);
@@ -438,60 +458,60 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     int best_indices[4];
     double best_error = HUGE_VALF;
 
-    double err01, err12, err23, err30;
-    double mse01, mse12, mse23, mse30;
-    double params01[4], params12[4];
-
     // disallow quads where the angle is less than a critical value.
     double max_dot = td->qtp.cos_critical_rad; //25*M_PI/180);
+
+    double max_line_fit_mse = td->qtp.max_line_fit_mse;
+
+    struct pair_fit memo_stack[16*16];
+    struct pair_fit *memo = memo_stack;
+    if (nmaxima > 16)
+        memo = malloc(sizeof(struct pair_fit)*nmaxima*nmaxima);
+    for (int i = 0; i < nmaxima*nmaxima; i++)
+        memo[i].computed = false;
 
     for (int m0 = 0; m0 < nmaxima - 3; m0++) {
         int i0 = maxima[m0];
 
         for (int m1 = m0+1; m1 < nmaxima - 2; m1++) {
-            int i1 = maxima[m1];
+            struct pair_fit *pf01 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m0, m1);
 
-            fit_line(lfps, sz, i0, i1, params01, &err01, &mse01);
-
-            if (mse01 > td->qtp.max_line_fit_mse)
+            if (pf01->mse > max_line_fit_mse)
                 continue;
 
             for (int m2 = m1+1; m2 < nmaxima - 1; m2++) {
-                int i2 = maxima[m2];
-
-                fit_line(lfps, sz, i1, i2, params12, &err12, &mse12);
-                if (mse12 > td->qtp.max_line_fit_mse)
+                struct pair_fit *pf12 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m1, m2);
+                if (pf12->mse > max_line_fit_mse)
                     continue;
 
-                double dot = params01[2]*params12[2] + params01[3]*params12[3];
+                double dot = pf01->params[2]*pf12->params[2] + pf01->params[3]*pf12->params[3];
                 if (fabs(dot) > max_dot)
                     continue;
 
                 for (int m3 = m2+1; m3 < nmaxima; m3++) {
-                    int i3 = maxima[m3];
-
-                    fit_line(lfps, sz, i2, i3, NULL, &err23, &mse23);
-                    if (mse23 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf23 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m2, m3);
+                    if (pf23->mse > max_line_fit_mse)
                         continue;
 
-                    fit_line(lfps, sz, i3, i0, NULL, &err30, &mse30);
-                    if (mse30 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf30 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m3, m0);
+                    if (pf30->mse > max_line_fit_mse)
                         continue;
 
-                    double err = err01 + err12 + err23 + err30;
+                    double err = pf01->err + pf12->err + pf23->err + pf30->err;
                     if (err < best_error) {
                         best_error = err;
                         best_indices[0] = i0;
-                        best_indices[1] = i1;
-                        best_indices[2] = i2;
-                        best_indices[3] = i3;
+                        best_indices[1] = maxima[m1];
+                        best_indices[2] = maxima[m2];
+                        best_indices[3] = maxima[m3];
                     }
                 }
             }
         }
     }
 
-    free(maxima);
+    if (memo != memo_stack)
+        free(memo);
 
     if (best_error == HUGE_VALF)
         return 0;
