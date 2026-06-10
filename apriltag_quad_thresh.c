@@ -372,7 +372,13 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     double *errs = malloc(sizeof(double)*sz);
 
     for (int i = 0; i < sz; i++) {
-        fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
+        int i0 = i - ksz;
+        if (i0 < 0)
+            i0 += sz;
+        int i1 = i + ksz;
+        if (i1 >= sz)
+            i1 -= sz;
+        fit_line(lfps, sz, i0, i1, NULL, &errs[i], NULL);
     }
 
     // apply a low-pass filter to errs
@@ -392,11 +398,17 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             qsm_kernel_init = true;
         }
 
+        // sz >= 12*ksz >= 24 > QSM_FSZ, so single wrap adjustments suffice
         for (int iy = 0; iy < sz; iy++) {
             double acc = 0;
 
+            int j = iy - QSM_FSZ / 2;
+            if (j < 0)
+                j += sz;
             for (int i = 0; i < QSM_FSZ; i++) {
-                acc += errs[(iy + i - QSM_FSZ / 2 + sz) % sz] * qsm_kernel[i];
+                acc += errs[j] * qsm_kernel[i];
+                if (++j == sz)
+                    j = 0;
             }
             y[iy] = acc;
         }
@@ -410,9 +422,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     int nmaxima = 0;
 
     for (int i = 0; i < sz; i++) {
-        if (errs[i] > errs[(i+1)%sz] && errs[i] > errs[(i+sz-1)%sz]) {
+        double e = errs[i];
+        if (e > errs[i + 1 == sz ? 0 : i + 1] && e > errs[i == 0 ? sz - 1 : i - 1]) {
             maxima[nmaxima] = i;
-            maxima_errs[nmaxima] = errs[i];
+            maxima_errs[nmaxima] = e;
             nmaxima++;
         }
     }
