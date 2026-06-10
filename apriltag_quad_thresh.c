@@ -727,7 +727,9 @@ void compute_lfps(int sz, zarray_t* cluster, image_u8_t* im, struct line_fit_pt 
     }
 }
 
-static inline void ptsort(struct pt *pts, int sz)
+// Sorting networks for <= 5 points, identical to the historical ptsort
+// base cases (ties are NOT swapped).
+static inline void pt_network_sort(struct pt *pts, int sz)
 {
 #define MAYBE_SWAP(arr,apos,bpos)                                   \
     if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
@@ -762,47 +764,27 @@ static inline void ptsort(struct pt *pts, int sz)
         MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
         return;
     }
-    if (sz == 5) {
-        // this 9-step swap is optimal for a sorting network, but two
-        // steps slower than a generic sort.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
-        MAYBE_SWAP(pts, 3, 4);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
-        MAYBE_SWAP(pts, 2, 4); // maximum element now at end
-        MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 1, 2);
-        return;
-    }
+
+    // sz == 5: this 9-step swap is optimal for a sorting network, but
+    // two steps slower than a generic sort.
+    struct pt tmp;
+    MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
+    MAYBE_SWAP(pts, 3, 4);
+    MAYBE_SWAP(pts, 1, 2);
+    MAYBE_SWAP(pts, 0, 1);
+    MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
+    MAYBE_SWAP(pts, 2, 4); // maximum element now at end
+    MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
+    MAYBE_SWAP(pts, 2, 3);
+    MAYBE_SWAP(pts, 1, 2);
 
 #undef MAYBE_SWAP
+}
 
-    // a merge sort with temp storage.
-    // Use stack allocation for small arrays to avoid malloc overhead
-    #define STACK_BUFFER_SIZE 256
-    struct pt stack_buffer[STACK_BUFFER_SIZE];
-    struct pt *tmp;
-    const bool use_heap = sz > STACK_BUFFER_SIZE;
-    if (use_heap) {
-        tmp = malloc(sizeof(struct pt) * sz);
-    } else {
-        tmp = stack_buffer;
-    }
-
-    memcpy(tmp, pts, sizeof(struct pt) * sz);
-
-    int asz = sz/2;
-    int bsz = sz - asz;
-
-    struct pt *as = &tmp[0];
-    struct pt *bs = &tmp[asz];
-
-    ptsort(as, asz);
-    ptsort(bs, bsz);
-
+// Merge two sorted runs into pts. Comparison sequence (including tie
+// behavior: ties take from bs) matches the historical ptsort merge.
+static inline void pt_merge(struct pt *as, int asz, struct pt *bs, int bsz, struct pt *pts)
+{
     #define MERGE(apos,bpos)                        \
     if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
         pts[outpos++] = as[apos++];             \
@@ -824,11 +806,44 @@ static inline void ptsort(struct pt *pts, int sz)
     if (bpos < bsz)
         memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
 
-    if (use_heap) {
-        free(tmp);
+#undef MERGE
+}
+
+// Ping-pong merge sort: same splits, same leaf networks, and same merge
+// comparisons as the historical copy-per-level ptsort -- so the result is
+// bit-identical (including tie ordering) -- but data is only copied at the
+// <= 5 element leaves rather than at every recursion level.
+static void ptsort_move(struct pt *A, struct pt *B, int sz);
+
+// sort A in place, using tmp (>= sz entries) as scratch
+static void ptsort_in_place(struct pt *A, struct pt *tmp, int sz)
+{
+    if (sz <= 5) {
+        pt_network_sort(A, sz);
+        return;
     }
 
-#undef MERGE
+    int asz = sz/2;
+    int bsz = sz - asz;
+    ptsort_move(A, tmp, asz);
+    ptsort_move(A + asz, tmp + asz, bsz);
+    pt_merge(tmp, asz, tmp + asz, bsz, A);
+}
+
+// sort A's contents into B (A is clobbered)
+static void ptsort_move(struct pt *A, struct pt *B, int sz)
+{
+    if (sz <= 5) {
+        pt_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(struct pt));
+        return;
+    }
+
+    int asz = sz/2;
+    int bsz = sz - asz;
+    ptsort_in_place(A, B, asz);
+    ptsort_in_place(A + asz, B + asz, bsz);
+    pt_merge(A, asz, A + asz, bsz, B);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
@@ -927,7 +942,7 @@ int fit_quad(
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        ptsort((struct pt*) cluster->data, sz);
+        ptsort_in_place((struct pt*) cluster->data, scratch->pt_tmp, sz);
     }
 
     struct line_fit_pt *lfps = scratch->lfps;
