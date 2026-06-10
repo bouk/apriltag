@@ -44,6 +44,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include "common/postscript_utils.h"
 #include "common/math_util.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #ifdef _WIN32
 static inline long int random(void)
 {
@@ -1378,7 +1382,53 @@ void do_minmax_task(void *p)
     int tw = task->im->width / tilesz;
     image_u8_t *im = task->im;
 
-    for (int tx = 0; tx < tw; tx++) {
+    int tx = 0;
+
+#ifdef __AVX2__
+    // 8 tiles (32 source columns) per iteration: reduce the four rows
+    // pointwise, then each 4-byte lane horizontally
+    const uint8_t *r0 = &im->buf[(ty*tilesz + 0)*s];
+    const uint8_t *r1 = &im->buf[(ty*tilesz + 1)*s];
+    const uint8_t *r2 = &im->buf[(ty*tilesz + 2)*s];
+    const uint8_t *r3 = &im->buf[(ty*tilesz + 3)*s];
+
+    const __m256i lane_lo = _mm256_setr_epi8(
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
+    for (; tx + 8 <= tw; tx += 8) {
+        __m256i a = _mm256_loadu_si256((const __m256i*)(r0 + 4*tx));
+        __m256i b = _mm256_loadu_si256((const __m256i*)(r1 + 4*tx));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(r2 + 4*tx));
+        __m256i d = _mm256_loadu_si256((const __m256i*)(r3 + 4*tx));
+
+        __m256i mx = _mm256_max_epu8(_mm256_max_epu8(a, b), _mm256_max_epu8(c, d));
+        __m256i mn = _mm256_min_epu8(_mm256_min_epu8(a, b), _mm256_min_epu8(c, d));
+
+        // horizontal reduce within each 32-bit lane; shifted-in zeros are
+        // neutral for max but must be masked to 0xff for min
+        mx = _mm256_max_epu8(mx, _mm256_srli_epi32(mx, 8));
+        mx = _mm256_max_epu8(mx, _mm256_srli_epi32(mx, 16));
+        mn = _mm256_min_epu8(mn, _mm256_or_si256(_mm256_srli_epi32(mn, 8),
+                                                 _mm256_set1_epi32(0xff000000)));
+        mn = _mm256_min_epu8(mn, _mm256_or_si256(_mm256_srli_epi32(mn, 16),
+                                                 _mm256_set1_epi32(0xffff0000)));
+
+        __m256i pmx = _mm256_shuffle_epi8(mx, lane_lo);
+        __m256i pmn = _mm256_shuffle_epi8(mn, lane_lo);
+
+        uint32_t omax_lo = (uint32_t)_mm256_extract_epi32(pmx, 0);
+        uint32_t omax_hi = (uint32_t)_mm256_extract_epi32(pmx, 4);
+        uint32_t omin_lo = (uint32_t)_mm256_extract_epi32(pmn, 0);
+        uint32_t omin_hi = (uint32_t)_mm256_extract_epi32(pmn, 4);
+        memcpy(&task->im_max[ty*tw + tx], &omax_lo, 4);
+        memcpy(&task->im_max[ty*tw + tx + 4], &omax_hi, 4);
+        memcpy(&task->im_min[ty*tw + tx], &omin_lo, 4);
+        memcpy(&task->im_min[ty*tw + tx + 4], &omin_hi, 4);
+    }
+#endif
+
+    for (; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
 
         for (int dy = 0; dy < tilesz; dy++) {
@@ -1408,7 +1458,58 @@ void do_blur_task(void *p)
     uint8_t *im_max = task->im_max;
     uint8_t *im_min = task->im_min;
 
+    // columns [vec_lo, vec_hi) are written by the vector loop; the scalar
+    // loop covers the rest (both edges and any partial-vector tail)
+    int vec_lo = 0, vec_hi = 0;
+
+#ifdef __AVX2__
+    if (tw >= 34) {
+        // vertical reduce of the (row-clamped) 3 rows, then horizontal
+        // 3-tap min/max via unaligned loads
+        const uint8_t *mxr0 = &im_max[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mxr1 = &im_max[ty*tw];
+        const uint8_t *mxr2 = &im_max[(ty < th-1 ? ty+1 : th-1)*tw];
+        const uint8_t *mnr0 = &im_min[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mnr1 = &im_min[ty*tw];
+        const uint8_t *mnr2 = &im_min[(ty < th-1 ? ty+1 : th-1)*tw];
+
+        vec_lo = 1;
+        vec_hi = 1;
+        for (int tx = 1; tx + 32 <= tw - 1; tx += 32) {
+            __m256i vx0 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx - 1)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx - 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx - 1))));
+            __m256i vx1 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx))));
+            __m256i vx2 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx + 1)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx + 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx + 1))));
+            _mm256_storeu_si256((__m256i*)(task->im_max_tmp + ty*tw + tx),
+                                _mm256_max_epu8(vx0, _mm256_max_epu8(vx1, vx2)));
+
+            __m256i vn0 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx - 1)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx - 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx - 1))));
+            __m256i vn1 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx))));
+            __m256i vn2 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx + 1)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx + 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx + 1))));
+            _mm256_storeu_si256((__m256i*)(task->im_min_tmp + ty*tw + tx),
+                                _mm256_min_epu8(vn0, _mm256_min_epu8(vn1, vn2)));
+
+            vec_hi = tx + 32;
+        }
+    }
+#endif
+
     for (int tx = 0; tx < tw; tx++) {
+        if (tx == vec_lo && vec_hi > vec_lo) {
+            tx = vec_hi - 1; // skip the vector-covered middle
+            continue;
+        }
         uint8_t max = 0, min = 255;
 
         for (int dy = -1; dy <= 1; dy++) {
