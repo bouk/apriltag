@@ -1925,7 +1925,51 @@ void do_threshold_task(void *p)
     image_u8_t *threshim = task->threshim;
     int min_white_black_diff = task->td->qtp.min_white_black_diff;
 
-    for (int tx = 0; tx < tw; tx++) {
+    int tx = 0;
+
+#ifdef __AVX2__
+    // 8 tiles (32 output columns) per iteration. Per tile: low-contrast
+    // tiles write 127, others write 255 where v > thresh with
+    // thresh = min + (max-min)/2. All integer, exactly like the scalar
+    // code. Requires min_white_black_diff >= 1 so that the threshold path
+    // only runs with max > min, keeping thresh+1 <= 255.
+    if (min_white_black_diff >= 1) {
+        const __m256i v127 = _mm256_set1_epi8(127);
+        const __m256i v1 = _mm256_set1_epi8(1);
+        const __m256i tm1 = _mm256_set1_epi8((char)(min_white_black_diff - 1 > 255 ? 255 : min_white_black_diff - 1));
+        const __m256i shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+
+        for (; tx + 8 <= tw; tx += 8) {
+            // 8 tile min/max bytes, expanded so each covers its 4 columns
+            __m256i mn8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_min[ty*tw + tx]));
+            __m256i mx8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_max[ty*tw + tx]));
+            __m256i mn = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mn8, 0x00), shuf);
+            __m256i mx = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mx8, 0x00), shuf);
+
+            __m256i diff = _mm256_sub_epi8(mx, mn); // max >= min, fits a byte
+            // low contrast: diff < t  <=>  satsub(diff, t-1) == 0
+            __m256i lc = _mm256_cmpeq_epi8(_mm256_subs_epu8(diff, tm1), _mm256_setzero_si256());
+
+            // thresh = min + diff/2; on this path diff >= 1, so thresh < max
+            // and thresh+1 <= 255
+            __m256i half = _mm256_and_si256(_mm256_srli_epi16(diff, 1), _mm256_set1_epi8(0x7f));
+            __m256i thresh1 = _mm256_add_epi8(_mm256_add_epi8(mn, half), v1);
+
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                __m256i v = _mm256_loadu_si256((const __m256i*)&im->buf[y*s + tx*tilesz]);
+                // v > thresh  <=>  v >= thresh+1  <=>  satsub(thresh+1, v) == 0
+                __m256i gt = _mm256_cmpeq_epi8(_mm256_subs_epu8(thresh1, v), _mm256_setzero_si256());
+                __m256i out = _mm256_blendv_epi8(gt, v127, lc); // gt mask is 0xff/0x00 = 255/0
+                _mm256_storeu_si256((__m256i*)&threshim->buf[y*s + tx*tilesz], out);
+            }
+        }
+    }
+#endif
+
+    for (; tx < tw; tx++) {
         int min = im_min[ty*tw + tx];
         int max = im_max[ty*tw + tx];
 
