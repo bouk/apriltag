@@ -1846,6 +1846,19 @@ zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
     return ret;
 }
 
+struct cluster_merge_task
+{
+    zarray_t *c1;
+    zarray_t *c2;
+    zarray_t *out;
+};
+
+static void do_cluster_merge_task(void *p)
+{
+    struct cluster_merge_task *task = (struct cluster_merge_task*) p;
+    task->out = merge_clusters(task->c1, task->c2);
+}
+
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
     int nclustermap = 0.2*w*h;
@@ -1880,20 +1893,29 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         clusters_list[i] = tasks[i].clusters;
     }
 
+    struct cluster_merge_task *mtasks = malloc(sizeof(struct cluster_merge_task)*(ntasks/2 + 1));
+
     int length = ntasks;
     while (length > 1) {
-        int write = 0;
-        for (int i = 0; i < length - 1; i += 2) {
-            clusters_list[write] = merge_clusters(clusters_list[i], clusters_list[i + 1]);
-            write++;
+        int npairs = length / 2;
+        for (int i = 0; i < npairs; i++) {
+            mtasks[i].c1 = clusters_list[2*i];
+            mtasks[i].c2 = clusters_list[2*i + 1];
+            workerpool_add_task(td->wp, do_cluster_merge_task, &mtasks[i]);
         }
+        workerpool_run(td->wp);
 
+        for (int i = 0; i < npairs; i++) {
+            clusters_list[i] = mtasks[i].out;
+        }
         if (length % 2) {
-            clusters_list[write] = clusters_list[length - 1];
+            clusters_list[npairs] = clusters_list[length - 1];
         }
 
-        length = (length >> 1) + length % 2;
+        length = npairs + length % 2;
     }
+
+    free(mtasks);
 
     clusters = zarray_create(sizeof(zarray_t*));
     zarray_ensure_capacity(clusters, zarray_size(clusters_list[0]));
