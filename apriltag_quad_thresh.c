@@ -1159,27 +1159,29 @@ static void do_quad_task(void *p)
         zarray_t **cluster;
         zarray_get_volatile(clusters, cidx, &cluster);
 
-        if (zarray_size(*cluster) < td->qtp.min_cluster_pixels)
-            continue;
-
         // a cluster should contain only boundary points around the
         // tag. it cannot be bigger than the whole screen. (Reject
         // large connected blobs that will be prohibitively slow to
         // fit quads to.) A typical point along an edge is added two
         // times (because it has 2 unique neighbors). The maximum
         // perimeter is 2w+2h.
-        if (zarray_size(*cluster) > 2*(2*w+2*h)) {
-            continue;
+        if (zarray_size(*cluster) >= td->qtp.min_cluster_pixels &&
+            zarray_size(*cluster) <= 2*(2*w+2*h)) {
+
+            struct quad quad;
+            memset(&quad, 0, sizeof(struct quad));
+
+            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
+                pthread_mutex_lock(&td->mutex);
+                zarray_add(quads, &quad);
+                pthread_mutex_unlock(&td->mutex);
+            }
         }
 
-        struct quad quad;
-        memset(&quad, 0, sizeof(struct quad));
-
-        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
-            pthread_mutex_lock(&td->mutex);
-            zarray_add(quads, &quad);
-            pthread_mutex_unlock(&td->mutex);
-        }
+        // destroy here, in parallel and while cache-warm, rather than in
+        // a serial loop after all quad tasks finish
+        zarray_destroy(*cluster);
+        *cluster = NULL;
     }
 
     quad_fit_scratch_free(&scratch);
@@ -2101,11 +2103,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "fit quads to clusters");
 
-    for (int i = 0; i < zarray_size(clusters); i++) {
-        zarray_t *cluster;
-        zarray_get(clusters, i, &cluster);
-        zarray_destroy(cluster);
-    }
+    // individual clusters were destroyed by the quad tasks
     zarray_destroy(clusters);
 
     return quads;
