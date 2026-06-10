@@ -945,11 +945,16 @@ static inline void key_network_sort(uint64_t *k, int sz)
 
 static inline void key_merge(uint64_t *as, int asz, uint64_t *bs, int bsz, uint64_t *out)
 {
-    #define MERGE(apos,bpos)            \
-    if (as[apos] < bs[bpos])            \
-        out[outpos++] = as[apos++];     \
-    else                                \
-        out[outpos++] = bs[bpos++];
+    // branchless select: merge comparisons are data-dependent coin flips,
+    // so conditional moves beat 50%-mispredicted branches
+    #define MERGE(apos,bpos)                            \
+    do {                                                \
+        uint64_t av = as[apos], bv = bs[bpos];          \
+        int take_a = av < bv;                           \
+        out[outpos++] = take_a ? av : bv;               \
+        apos += take_a;                                 \
+        bpos += !take_a;                                \
+    } while (0)
 
     int apos = 0, bpos = 0, outpos = 0;
     while (apos + 8 < asz && bpos + 8 < bsz) {
