@@ -1655,8 +1655,10 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     return uf;
 }
 
+// nclustermap must be a power of two.
 zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
     struct uint64_zarray_entry **clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
+    uint32_t bucket_mask = (uint32_t)nclustermap - 1;
 
     int mem_chunk_size = 2048;
     struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*(1 + 2 * nclustermap / mem_chunk_size)); // SmodeTech: avoid memory corruption when nclustermap < mem_chunk_size
@@ -1716,7 +1718,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                             clusterid = (rep0 << 32) + rep1;                \
                                                                             \
                         /* XXX lousy hash function */                       \
-                        uint32_t clustermap_bucket = u64hash_2(clusterid) % nclustermap; \
+                        uint32_t clustermap_bucket = u64hash_2(clusterid) & bucket_mask; \
                         struct uint64_zarray_entry *entry = clustermap[clustermap_bucket]; \
                         while (entry && entry->id != clusterid) {           \
                             entry = entry->next;                            \
@@ -1861,11 +1863,17 @@ static void do_cluster_merge_task(void *p)
 
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
-    int nclustermap = 0.2*w*h;
 
     int sz = h - 1;
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
     struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
+
+    // per-task hash table: power of two so lookups can mask instead of
+    // divide, and sized to the slab (entry counts run well below one
+    // per 64 slab pixels) so it stays cache resident.
+    int nclustermap = 1024;
+    while (nclustermap < chunksize*w / 64 && nclustermap < 65536)
+        nclustermap <<= 1;
 
     int ntasks = 0;
 
@@ -1878,7 +1886,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].s = ts;
         tasks[ntasks].uf = uf;
         tasks[ntasks].im = threshim;
-        tasks[ntasks].nclustermap = nclustermap/(sz / chunksize + 1);
+        tasks[ntasks].nclustermap = nclustermap;
         tasks[ntasks].min_cluster_pixels = td->qtp.min_cluster_pixels;
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
 
