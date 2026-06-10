@@ -1681,12 +1681,12 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 continue;
             }
 
-            // XXX don't query this until we know we need it?
-            uint64_t rep0 = unionfind_get_representative(uf, y*w + x);
-            if ((int)unionfind_get_set_size(uf, rep0) < min_cluster_pixels) {
-                connected_last = false;
-                continue;
-            }
+            // representative of this pixel's connected component, computed
+            // lazily on the first black/white boundary neighbor since most
+            // pixels are interior to a region and have none.
+            // state: 0 = unknown, 1 = usable, 2 = component too small
+            uint64_t rep0 = 0;
+            int rep0_state = 0;
 
             // whenever we find two adjacent pixels such that one is
             // white and the other black, we add the point half-way
@@ -1714,6 +1714,11 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 uint8_t v1 = threshim->buf[(y + dy)*ts + x + dx];       \
                                                                         \
                 if (v0 + v1 == 255) {                                   \
+                    if (rep0_state == 0) {                              \
+                        rep0 = unionfind_get_representative(uf, y*w + x); \
+                        rep0_state = ((int)unionfind_get_set_size(uf, rep0) >= min_cluster_pixels) ? 1 : 2; \
+                    }                                                   \
+                    if (rep0_state == 1) {                              \
                     uint64_t rep1 = unionfind_get_representative(uf, (y + dy)*w + x + dx); \
                     if ((int)unionfind_get_set_size(uf, rep1) >= min_cluster_pixels) { \
                         uint64_t clusterid;                                 \
@@ -1757,6 +1762,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
                         zarray_add(entry->cluster, &p);                     \
                         connected = true;                                   \
+                    }                                                   \
                     }                                                   \
                 }                                                       \
             }
