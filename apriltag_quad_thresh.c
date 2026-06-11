@@ -556,6 +556,39 @@ int quad_segment_maxima(apriltag_detector_t *td, int sz, const struct lfps_soa *
                           _mm256_sub_pd(_mm256_add_pd(Cxx, Cyy), root));
             _mm256_storeu_pd(&errs[i], _mm256_mul_pd(vN, eig));
         }
+#elif defined(__ARM_NEON)
+        // 2 windows per iteration; the SoA loads are contiguous and every
+        // step is a single exact-rounded operation, including the
+        // double->float->sqrtf->double sequence of the scalar code
+        const float64x2_t half = vdupq_n_f64(0.5);
+        const float64x2_t four = vdupq_n_f64(4.0);
+        const float64x2_t vN = vdupq_n_f64((double)N);
+        for (; i + 2 <= mid_hi + 1; i += 2) {
+            int u = i + ksz, l = i - ksz - 1;
+
+            float64x2_t Mx  = vsubq_f64(vld1q_f64(&aMx[u]),  vld1q_f64(&aMx[l]));
+            float64x2_t My  = vsubq_f64(vld1q_f64(&aMy[u]),  vld1q_f64(&aMy[l]));
+            float64x2_t Mxx = vsubq_f64(vld1q_f64(&aMxx[u]), vld1q_f64(&aMxx[l]));
+            float64x2_t Mxy = vsubq_f64(vld1q_f64(&aMxy[u]), vld1q_f64(&aMxy[l]));
+            float64x2_t Myy = vsubq_f64(vld1q_f64(&aMyy[u]), vld1q_f64(&aMyy[l]));
+            float64x2_t W   = vsubq_f64(vld1q_f64(&aW[u]),   vld1q_f64(&aW[l]));
+
+            float64x2_t Ex = vdivq_f64(Mx, W);
+            float64x2_t Ey = vdivq_f64(My, W);
+            float64x2_t Cxx = vsubq_f64(vdivq_f64(Mxx, W), vmulq_f64(Ex, Ex));
+            float64x2_t Cxy = vsubq_f64(vdivq_f64(Mxy, W), vmulq_f64(Ex, Ey));
+            float64x2_t Cyy = vsubq_f64(vdivq_f64(Myy, W), vmulq_f64(Ey, Ey));
+
+            float64x2_t d = vsubq_f64(Cxx, Cyy);
+            float64x2_t rad = vaddq_f64(vmulq_f64(d, d),
+                                        vmulq_f64(four, vmulq_f64(Cxy, Cxy)));
+            // sqrtf semantics: round to float, sqrt in float, widen back
+            float64x2_t root = vcvt_f64_f32(vsqrt_f32(vcvt_f32_f64(rad)));
+
+            float64x2_t eig = vmulq_f64(half,
+                              vsubq_f64(vaddq_f64(Cxx, Cyy), root));
+            vst1q_f64(&errs[i], vmulq_f64(vN, eig));
+        }
 #endif
 
         for (; i <= mid_hi; i++) {
@@ -642,6 +675,39 @@ int quad_segment_maxima(apriltag_detector_t *td, int sz, const struct lfps_soa *
                 y[e] = acc;
             }
         }
+#elif defined(__ARM_NEON)
+        // middle outputs need no wrap handling; 4 outputs per iteration
+        // (two independent accumulator chains) with the same per-output
+        // tap order as the scalar code
+        {
+            float64x2_t k[QSM_FSZ];
+            for (int t = 0; t < QSM_FSZ; t++)
+                k[t] = vdupq_n_f64(qsm_kernel[t]);
+
+            for (iy = QSM_FSZ/2; iy + 4 <= sz - QSM_FSZ/2; iy += 4) {
+                const double *base = &errs[iy - QSM_FSZ/2];
+                float64x2_t acc0 = vmulq_f64(vld1q_f64(base), k[0]);
+                float64x2_t acc1 = vmulq_f64(vld1q_f64(base + 2), k[0]);
+                for (int t = 1; t < QSM_FSZ; t++) {
+                    acc0 = vaddq_f64(acc0, vmulq_f64(vld1q_f64(base + t), k[t]));
+                    acc1 = vaddq_f64(acc1, vmulq_f64(vld1q_f64(base + t + 2), k[t]));
+                }
+                vst1q_f64(&y[iy], acc0);
+                vst1q_f64(&y[iy + 2], acc1);
+            }
+            // the scalar loop below covers [0, QSM_FSZ/2), the vector tail,
+            // and the wrapped end region
+            for (int e = 0; e < QSM_FSZ/2; e++) {
+                int j = e - QSM_FSZ / 2 + sz;
+                double acc = 0;
+                for (int i = 0; i < QSM_FSZ; i++) {
+                    acc += errs[j] * qsm_kernel[i];
+                    if (++j == sz)
+                        j = 0;
+                }
+                y[e] = acc;
+            }
+        }
 #endif
 
         for (; iy < sz; iy++) {
@@ -682,6 +748,35 @@ int quad_segment_maxima(apriltag_detector_t *td, int sz, const struct lfps_soa *
             __m256d gt_next = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi+1]), _CMP_GT_OQ);
             __m256d gt_prev = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi-1]), _CMP_GT_OQ);
             int m = _mm256_movemask_pd(_mm256_and_pd(gt_next, gt_prev));
+            while (m) {
+                int b = __builtin_ctz(m);
+                m &= m - 1;
+                maxima[nmaxima] = mi + b;
+                maxima_errs[nmaxima] = errs[mi + b];
+                nmaxima++;
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    // interior positions, 4 at a time (two f64x2 compares): local maxima
+    // become a 4-bit mask via lane-weighted horizontal add
+    {
+        // wrap position i = 0 first
+        if (errs[0] > errs[1] && errs[0] > errs[sz-1]) {
+            maxima[nmaxima] = 0;
+            maxima_errs[nmaxima] = errs[0];
+            nmaxima++;
+        }
+        const uint32x4_t lane_weights = {1, 2, 4, 8};
+        for (mi = 1; mi + 4 <= sz - 1; mi += 4) {
+            float64x2_t e0 = vld1q_f64(&errs[mi]);
+            float64x2_t e1 = vld1q_f64(&errs[mi + 2]);
+            uint64x2_t m0 = vandq_u64(vcgtq_f64(e0, vld1q_f64(&errs[mi + 1])),
+                                      vcgtq_f64(e0, vld1q_f64(&errs[mi - 1])));
+            uint64x2_t m1 = vandq_u64(vcgtq_f64(e1, vld1q_f64(&errs[mi + 3])),
+                                      vcgtq_f64(e1, vld1q_f64(&errs[mi + 1])));
+            uint32x4_t m01 = vcombine_u32(vmovn_u64(m0), vmovn_u64(m1));
+            unsigned m = vaddvq_u32(vandq_u32(m01, lane_weights));
             while (m) {
                 int b = __builtin_ctz(m);
                 m &= m - 1;
@@ -946,7 +1041,7 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
     // expression yields exactly 1.
     int i = 0;
 
-#ifdef __AVX2__
+#if defined(__AVX2__) || defined(__ARM_NEON)
     {
         double g2[4];
         const uint8_t *ibuf = im->buf;
@@ -974,8 +1069,14 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
                     g2[j] = 0;
                 }
             }
+#ifdef __AVX2__
             __m256d w = _mm256_sqrt_pd(_mm256_loadu_pd(g2));
             _mm256_storeu_pd(&wbuf[i], _mm256_add_pd(w, _mm256_set1_pd(1.0)));
+#else
+            const float64x2_t one = vdupq_n_f64(1.0);
+            vst1q_f64(&wbuf[i], vaddq_f64(vsqrtq_f64(vld1q_f64(&g2[0])), one));
+            vst1q_f64(&wbuf[i+2], vaddq_f64(vsqrtq_f64(vld1q_f64(&g2[2])), one));
+#endif
         }
     }
 #endif
