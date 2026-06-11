@@ -55,6 +55,8 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 #include "common/postscript_utils.h"
@@ -946,6 +948,99 @@ static void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct qu
                 s2 = _mm_add_pd(_mm256_castpd256_pd128(vMcount),
                                 _mm256_extractf128_pd(vMcount, 1));
                 Mcount += _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+            }
+#elif defined(__ARM_NEON)
+            // two steps at a time; lanes that fail a bounds check or the
+            // gradient test contribute exactly 0.0 to the accumulators
+            {
+                int iw = im_orig->width, ih = im_orig->height, istride = im_orig->stride;
+                const uint8_t *ibuf = im_orig->buf;
+                const float64x2_t vone = vdupq_n_f64(1.0);
+                const float64x2_t vx0 = vdupq_n_f64(x0), vy0 = vdupq_n_f64(y0);
+                const float64x2_t vnx = vdupq_n_f64(nx), vny = vdupq_n_f64(ny);
+                const float64x2_t vdelta = vdupq_n_f64(delta);
+                const float64x2_t vnrange = vdupq_n_f64(-range);
+                const float64x2_t vslen = vdupq_n_f64(step_length);
+                const int64x2_t zero64 = vdupq_n_s64(0);
+                const int64x2_t wlim = vdupq_n_s64(iw - 1), hlim = vdupq_n_s64(ih - 1);
+                float64x2_t vMn = vdupq_n_f64(0.0), vMcount = vdupq_n_f64(0.0);
+                float64x2_t vstep = {0, 1};
+                for (; step0 + 2 <= max_steps; step0 += 2) {
+                    float64x2_t n = vaddq_f64(vnrange, vmulq_f64(vslen, vstep));
+                    vstep = vaddq_f64(vstep, vdupq_n_f64(2.0));
+
+                    float64x2_t x1 = vsubq_f64(vaddq_f64(vx0,
+                                     vmulq_f64(vaddq_f64(n, vone), vnx)), vdelta);
+                    float64x2_t y1 = vsubq_f64(vaddq_f64(vy0,
+                                     vmulq_f64(vaddq_f64(n, vone), vny)), vdelta);
+                    float64x2_t x2 = vsubq_f64(vaddq_f64(vx0,
+                                     vmulq_f64(vsubq_f64(n, vone), vnx)), vdelta);
+                    float64x2_t y2 = vsubq_f64(vaddq_f64(vy0,
+                                     vmulq_f64(vsubq_f64(n, vone), vny)), vdelta);
+
+                    // trunc toward zero, like the scalar (int) casts
+                    int64x2_t x1i = vcvtq_s64_f64(x1), y1i = vcvtq_s64_f64(y1);
+                    int64x2_t x2i = vcvtq_s64_f64(x2), y2i = vcvtq_s64_f64(y2);
+                    float64x2_t a1 = vsubq_f64(x1, vcvtq_f64_s64(x1i));
+                    float64x2_t b1 = vsubq_f64(y1, vcvtq_f64_s64(y1i));
+                    float64x2_t a2 = vsubq_f64(x2, vcvtq_f64_s64(x2i));
+                    float64x2_t b2 = vsubq_f64(y2, vcvtq_f64_s64(y2i));
+
+                    // bounds: xi >= 0 && xi+1 < w && yi >= 0 && yi+1 < h
+                    uint64x2_t okmask = vandq_u64(
+                        vandq_u64(vandq_u64(vcgeq_s64(x1i, zero64), vcltq_s64(x1i, wlim)),
+                                  vandq_u64(vcgeq_s64(y1i, zero64), vcltq_s64(y1i, hlim))),
+                        vandq_u64(vandq_u64(vcgeq_s64(x2i, zero64), vcltq_s64(x2i, wlim)),
+                                  vandq_u64(vcgeq_s64(y2i, zero64), vcltq_s64(y2i, hlim))));
+
+                    // clamp indices so masked lanes still load safely
+                    int64_t xa2[2], ya2[2], xb2[2], yb2[2];
+                    vst1q_s64(xa2, x1i);
+                    vst1q_s64(ya2, y1i);
+                    vst1q_s64(xb2, x2i);
+                    vst1q_s64(yb2, y2i);
+
+                    double p00[2], p01[2], p10[2], p11[2], q00[2], q01[2], q10[2], q11[2];
+                    for (int l = 0; l < 2; l++) {
+                        int xa = xa2[l] < 0 ? 0 : (xa2[l] > iw-2 ? iw-2 : (int)xa2[l]);
+                        int ya = ya2[l] < 0 ? 0 : (ya2[l] > ih-2 ? ih-2 : (int)ya2[l]);
+                        int xb = xb2[l] < 0 ? 0 : (xb2[l] > iw-2 ? iw-2 : (int)xb2[l]);
+                        int yb = yb2[l] < 0 ? 0 : (yb2[l] > ih-2 ? ih-2 : (int)yb2[l]);
+                        p00[l] = ibuf[ya*istride + xa];
+                        p01[l] = ibuf[ya*istride + xa + 1];
+                        p10[l] = ibuf[(ya+1)*istride + xa];
+                        p11[l] = ibuf[(ya+1)*istride + xa + 1];
+                        q00[l] = ibuf[yb*istride + xb];
+                        q01[l] = ibuf[yb*istride + xb + 1];
+                        q10[l] = ibuf[(yb+1)*istride + xb];
+                        q11[l] = ibuf[(yb+1)*istride + xb + 1];
+                    }
+
+                    float64x2_t na1 = vsubq_f64(vone, a1), nb1 = vsubq_f64(vone, b1);
+                    float64x2_t na2 = vsubq_f64(vone, a2), nb2 = vsubq_f64(vone, b2);
+                    float64x2_t g1 = vaddq_f64(vaddq_f64(
+                        vmulq_f64(vmulq_f64(na1, nb1), vld1q_f64(p00)),
+                        vmulq_f64(vmulq_f64(a1, nb1), vld1q_f64(p01))),
+                        vaddq_f64(
+                        vmulq_f64(vmulq_f64(na1, b1), vld1q_f64(p10)),
+                        vmulq_f64(vmulq_f64(a1, b1), vld1q_f64(p11))));
+                    float64x2_t g2 = vaddq_f64(vaddq_f64(
+                        vmulq_f64(vmulq_f64(na2, nb2), vld1q_f64(q00)),
+                        vmulq_f64(vmulq_f64(a2, nb2), vld1q_f64(q01))),
+                        vaddq_f64(
+                        vmulq_f64(vmulq_f64(na2, b2), vld1q_f64(q10)),
+                        vmulq_f64(vmulq_f64(a2, b2), vld1q_f64(q11))));
+
+                    // reject g1 < g2 along with the out-of-bounds lanes
+                    uint64x2_t keep = vbicq_u64(okmask, vcltq_f64(g1, g2));
+                    float64x2_t d = vsubq_f64(g2, g1);
+                    float64x2_t weight = vreinterpretq_f64_u64(vandq_u64(
+                        vreinterpretq_u64_f64(vmulq_f64(d, d)), keep));
+                    vMn = vaddq_f64(vMn, vmulq_f64(weight, n));
+                    vMcount = vaddq_f64(vMcount, weight);
+                }
+                Mn += vaddvq_f64(vMn);
+                Mcount += vaddvq_f64(vMcount);
             }
 #endif
 
