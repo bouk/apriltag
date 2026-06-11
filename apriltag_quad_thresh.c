@@ -1326,6 +1326,27 @@ int fit_quad(
             if (tmx[k+1] > ymax) ymax = tmx[k+1];
         }
     }
+#elif defined(__ARM_NEON)
+    // 2 points per vector; x sits in u16 lanes 0,4 and y in 1,5 (gx/gy
+    // lanes are reduced too but ignored)
+    if (szc - pidx >= 4) {
+        uint16x8_t vmn = vdupq_n_u16(0xffff);
+        uint16x8_t vmx = vdupq_n_u16(0);
+        for (; pidx + 2 <= szc; pidx += 2) {
+            uint16x8_t v = vld1q_u16((const uint16_t*)&pts[pidx]);
+            vmn = vminq_u16(vmn, v);
+            vmx = vmaxq_u16(vmx, v);
+        }
+        uint16_t tmn[8], tmx[8];
+        vst1q_u16(tmn, vmn);
+        vst1q_u16(tmx, vmx);
+        for (int k = 0; k < 8; k += 4) {
+            if (tmn[k] < xmin) xmin = tmn[k];
+            if (tmn[k+1] < ymin) ymin = tmn[k+1];
+            if (tmx[k] > xmax) xmax = tmx[k];
+            if (tmx[k+1] > ymax) ymax = tmx[k+1];
+        }
+    }
 #endif
 
     for (; pidx < szc; pidx++) {
@@ -1466,6 +1487,72 @@ int fit_quad(
         d4 = _mm_add_ps(d4, _mm_movehl_ps(d4, d4));
         d4 = _mm_add_ss(d4, _mm_shuffle_ps(d4, d4, 1));
         dot += _mm_cvtss_f32(d4);
+    }
+#elif defined(__ARM_NEON)
+    // 4 points per iteration; vld4 deinterleaves x/y/gx/gy directly.
+    // Every step of the key computation is a single exact-rounded
+    // operation or a bit-level select, so the keys match the scalar
+    // computation bit for bit. The dot accumulates in 4 lanes (summed at
+    // the end); it only decides the border-orientation sign.
+    {
+        const float32x4_t vcx = vdupq_n_f32(cx);
+        const float32x4_t vcy = vdupq_n_f32(cy);
+        const float32x4_t q00 = vdupq_n_f32(quadrants[0][0]);
+        const float32x4_t q01 = vdupq_n_f32(quadrants[0][1]);
+        const float32x4_t q10 = vdupq_n_f32(quadrants[1][0]);
+        const float32x4_t q11 = vdupq_n_f32(quadrants[1][1]);
+        const float32x4_t zero = vdupq_n_f32(0.0f);
+        const uint32x4_t signbit = vdupq_n_u32(0x80000000u);
+        const uint32x4_t idx_base = {0, 1, 2, 3};
+        float32x4_t dotacc = zero;
+
+        for (; pidx + 4 <= sz; pidx += 4) {
+            uint16x4x4_t p = vld4_u16((const uint16_t*)&pts[pidx]);
+            float32x4_t dx = vsubq_f32(vcvtq_f32_u32(vmovl_u16(p.val[0])), vcx);
+            float32x4_t dy = vsubq_f32(vcvtq_f32_u32(vmovl_u16(p.val[1])), vcy);
+            float32x4_t gx = vcvtq_f32_s32(vmovl_s16(vreinterpret_s16_u16(p.val[2])));
+            float32x4_t gy = vcvtq_f32_s32(vmovl_s16(vreinterpret_s16_u16(p.val[3])));
+
+            // dot += dx*gx + dy*gy, accumulated per lane
+            dotacc = vaddq_f32(dotacc,
+                     vaddq_f32(vmulq_f32(dx, gx), vmulq_f32(dy, gy)));
+
+            uint32x4_t dxpos = vcgtq_f32(dx, zero);
+            uint32x4_t dypos = vcgtq_f32(dy, zero);
+            float32x4_t quadrant = vbslq_f32(dypos,
+                vbslq_f32(dxpos, q11, q10),
+                vbslq_f32(dxpos, q01, q00));
+
+            // if (dy < 0) negate both
+            uint32x4_t flip = vandq_u32(vcltq_f32(dy, zero), signbit);
+            dx = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(dx), flip));
+            dy = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(dy), flip));
+
+            // if (dx < 0) rotate: dx' = dy, dy' = -dx
+            uint32x4_t dxneg = vcltq_f32(dx, zero);
+            float32x4_t mdx = vreinterpretq_f32_u32(
+                veorq_u32(vreinterpretq_u32_f32(dx), signbit));
+            float32x4_t ndx = vbslq_f32(dxneg, dy, dx);
+            float32x4_t ndy = vbslq_f32(dxneg, mdx, dy);
+
+            float32x4_t slope = vaddq_f32(quadrant, vdivq_f32(ndy, ndx));
+
+            // monotone float-bits -> u32 key transform
+            int32x4_t bits = vreinterpretq_s32_f32(slope);
+            uint32x4_t sgn = vreinterpretq_u32_s32(vshrq_n_s32(bits, 31));
+            uint32x4_t key = veorq_u32(vreinterpretq_u32_s32(bits),
+                                       vorrq_u32(sgn, signbit));
+
+            // complemented original indices (lanes are in point order)
+            uint32x4_t nidx = vmvnq_u32(vaddq_u32(vdupq_n_u32(pidx), idx_base));
+
+            // interleave (key << 32) | ~index into u64 lanes
+            uint32x4x2_t z = vzipq_u32(nidx, key);
+            vst1q_u32((uint32_t*)&keys[pidx], z.val[0]);
+            vst1q_u32((uint32_t*)&keys[pidx + 2], z.val[1]);
+        }
+
+        dot += vaddvq_f32(dotacc);
     }
 #endif
 

@@ -21,6 +21,23 @@ RESULTS=${RESULTS:-results.tsv}
 
 cmake --build "$BUILD_DIR" -j "$(sysctl -n hw.ncpu)" > /dev/null
 
+# this machine is shared; numbers taken under load are garbage. Wait for a
+# quiet window (1-min load average below threshold), up to MAX_WAIT seconds.
+LOAD_MAX=${LOAD_MAX:-5.0}
+MAX_WAIT=${MAX_WAIT:-900}
+waited=0
+while :; do
+    load=$(sysctl -n vm.loadavg | awk '{print $2}')
+    ok=$(awk -v l="$load" -v m="$LOAD_MAX" 'BEGIN { print (l < m) ? 1 : 0 }')
+    [ "$ok" = 1 ] && break
+    if [ "$waited" -ge "$MAX_WAIT" ]; then
+        echo "warning: load still $load after ${MAX_WAIT}s; benchmarking anyway" >&2
+        break
+    fi
+    echo "load $load >= $LOAD_MAX, waiting for a quiet window..." >&2
+    sleep 30; waited=$((waited+30))
+done
+
 images=("$IMAGE_DIR"/*.jpg)
 [ -e "${images[0]}" ] || { echo "no images in $IMAGE_DIR" >&2; exit 1; }
 
