@@ -46,6 +46,8 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 #ifdef _WIN32
@@ -2036,6 +2038,35 @@ void do_minmax_task(void *p)
         memcpy(&task->im_min[ty*tw + tx], &omin_lo, 4);
         memcpy(&task->im_min[ty*tw + tx + 4], &omin_hi, 4);
     }
+#elif defined(__ARM_NEON)
+    // 4 tiles (16 source columns) per iteration: reduce the four rows
+    // pointwise, then two pairwise rounds collapse each 4-byte lane
+    const uint8_t *r0 = &im->buf[(ty*tilesz + 0)*s];
+    const uint8_t *r1 = &im->buf[(ty*tilesz + 1)*s];
+    const uint8_t *r2 = &im->buf[(ty*tilesz + 2)*s];
+    const uint8_t *r3 = &im->buf[(ty*tilesz + 3)*s];
+
+    for (; tx + 4 <= tw; tx += 4) {
+        uint8x16_t a = vld1q_u8(r0 + 4*tx);
+        uint8x16_t b = vld1q_u8(r1 + 4*tx);
+        uint8x16_t c = vld1q_u8(r2 + 4*tx);
+        uint8x16_t d = vld1q_u8(r3 + 4*tx);
+
+        uint8x16_t mx = vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d));
+        uint8x16_t mn = vminq_u8(vminq_u8(a, b), vminq_u8(c, d));
+
+        // adjacent-pair reduce twice: lanes 0..3 end up holding the
+        // per-tile result for the 4 tiles
+        mx = vpmaxq_u8(mx, mx);
+        mx = vpmaxq_u8(mx, mx);
+        mn = vpminq_u8(mn, mn);
+        mn = vpminq_u8(mn, mn);
+
+        uint32_t omax = vgetq_lane_u32(vreinterpretq_u32_u8(mx), 0);
+        uint32_t omin = vgetq_lane_u32(vreinterpretq_u32_u8(mn), 0);
+        memcpy(&task->im_max[ty*tw + tx], &omax, 4);
+        memcpy(&task->im_min[ty*tw + tx], &omin, 4);
+    }
 #endif
 
     for (; tx < tw; tx++) {
@@ -2111,6 +2142,47 @@ void do_blur_task(void *p)
                                 _mm256_min_epu8(vn0, _mm256_min_epu8(vn1, vn2)));
 
             vec_hi = tx + 32;
+        }
+    }
+#elif defined(__ARM_NEON)
+    if (tw >= 18) {
+        // vertical reduce of the (row-clamped) 3 rows, then horizontal
+        // 3-tap min/max via unaligned loads; 16 columns per iteration
+        const uint8_t *mxr0 = &im_max[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mxr1 = &im_max[ty*tw];
+        const uint8_t *mxr2 = &im_max[(ty < th-1 ? ty+1 : th-1)*tw];
+        const uint8_t *mnr0 = &im_min[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mnr1 = &im_min[ty*tw];
+        const uint8_t *mnr2 = &im_min[(ty < th-1 ? ty+1 : th-1)*tw];
+
+        vec_lo = 1;
+        vec_hi = 1;
+        for (int tx = 1; tx + 16 <= tw - 1; tx += 16) {
+            uint8x16_t vx0 = vmaxq_u8(vld1q_u8(mxr0 + tx - 1),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx - 1),
+                                      vld1q_u8(mxr2 + tx - 1)));
+            uint8x16_t vx1 = vmaxq_u8(vld1q_u8(mxr0 + tx),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx),
+                                      vld1q_u8(mxr2 + tx)));
+            uint8x16_t vx2 = vmaxq_u8(vld1q_u8(mxr0 + tx + 1),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx + 1),
+                                      vld1q_u8(mxr2 + tx + 1)));
+            vst1q_u8(task->im_max_tmp + ty*tw + tx,
+                     vmaxq_u8(vx0, vmaxq_u8(vx1, vx2)));
+
+            uint8x16_t vn0 = vminq_u8(vld1q_u8(mnr0 + tx - 1),
+                             vminq_u8(vld1q_u8(mnr1 + tx - 1),
+                                      vld1q_u8(mnr2 + tx - 1)));
+            uint8x16_t vn1 = vminq_u8(vld1q_u8(mnr0 + tx),
+                             vminq_u8(vld1q_u8(mnr1 + tx),
+                                      vld1q_u8(mnr2 + tx)));
+            uint8x16_t vn2 = vminq_u8(vld1q_u8(mnr0 + tx + 1),
+                             vminq_u8(vld1q_u8(mnr1 + tx + 1),
+                                      vld1q_u8(mnr2 + tx + 1)));
+            vst1q_u8(task->im_min_tmp + ty*tw + tx,
+                     vminq_u8(vn0, vminq_u8(vn1, vn2)));
+
+            vec_hi = tx + 16;
         }
     }
 #endif
@@ -2191,6 +2263,42 @@ static void threshold_tile_row(apriltag_detector_t *td, image_u8_t *im, image_u8
                 __m256i gt = _mm256_cmpeq_epi8(_mm256_subs_epu8(thresh1, v), _mm256_setzero_si256());
                 __m256i out = _mm256_blendv_epi8(gt, v127, lc); // gt mask is 0xff/0x00 = 255/0
                 _mm256_storeu_si256((__m256i*)&threshim->buf[y*s + tx*tilesz], out);
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    // 4 tiles (16 output columns) per iteration; same integer arithmetic
+    // and min_white_black_diff >= 1 requirement as the AVX2 path
+    if (min_white_black_diff >= 1) {
+        const uint8x16_t v127 = vdupq_n_u8(127);
+        const uint8x16_t v1 = vdupq_n_u8(1);
+        const uint8x16_t vzero = vdupq_n_u8(0);
+        const uint8x16_t tm1 = vdupq_n_u8(min_white_black_diff - 1 > 255 ? 255 : min_white_black_diff - 1);
+        const uint8x16_t shuf = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+
+        for (; tx + 4 <= tw; tx += 4) {
+            // 4 tile min/max bytes, expanded so each covers its 4 columns
+            uint32_t mnw, mxw;
+            memcpy(&mnw, &im_min[ty*tw + tx], 4);
+            memcpy(&mxw, &im_max[ty*tw + tx], 4);
+            uint8x16_t mn = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(mnw)), shuf);
+            uint8x16_t mx = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(mxw)), shuf);
+
+            uint8x16_t diff = vsubq_u8(mx, mn); // max >= min, fits a byte
+            // low contrast: diff < t  <=>  satsub(diff, t-1) == 0
+            uint8x16_t lc = vceqq_u8(vqsubq_u8(diff, tm1), vzero);
+
+            // thresh = min + diff/2; on this path diff >= 1, so thresh < max
+            // and thresh+1 <= 255
+            uint8x16_t thresh1 = vaddq_u8(vaddq_u8(mn, vshrq_n_u8(diff, 1)), v1);
+
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                uint8x16_t v = vld1q_u8(&im->buf[y*s + tx*tilesz]);
+                // v > thresh  <=>  v >= thresh+1  <=>  satsub(thresh+1, v) == 0
+                uint8x16_t gt = vceqq_u8(vqsubq_u8(thresh1, v), vzero);
+                uint8x16_t out = vbslq_u8(lc, v127, gt); // gt mask is 0xff/0x00 = 255/0
+                vst1q_u8(&threshim->buf[y*s + tx*tilesz], out);
             }
         }
     }
