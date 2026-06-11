@@ -3215,6 +3215,21 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                                 q0 += 2*b;
                                 q1 += 2*b;
                             }
+#elif defined(__ARM_NEON)
+                            {
+                                // two pairs (4 points) per store pair
+                                uint64x2_t qa = {q0, q1};
+                                uint64x2_t qb = {q0 + 2, q1 + 2};
+                                const uint64x2_t step = vdupq_n_u64(4);
+                                for (; b + 2 <= batch; b += 2) {
+                                    vst1q_u64(&dst[2*b], qa);
+                                    vst1q_u64(&dst[2*b + 2], qb);
+                                    qa = vaddq_u64(qa, step);
+                                    qb = vaddq_u64(qb, step);
+                                }
+                                q0 += 2*b;
+                                q1 += 2*b;
+                            }
 #endif
                             for (; b < batch; b++) {
                                 dst[2*b] = q0;
