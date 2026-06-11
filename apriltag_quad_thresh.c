@@ -1677,6 +1677,29 @@ static int rle_row(const uint8_t *row, int w, struct row_run *runs)
             v = row[cx];
         }
     }
+#elif defined(__ARM_NEON)
+    // value-change positions 16 at a time; vshrn narrows each byte's
+    // compare mask to a nibble, so a changed byte sets 4 mask bits
+    for (; x + 16 <= xmax + 1; x += 16) {
+        uint8x16_t cur = vld1q_u8(row + x);
+        uint8x16_t prv = vld1q_u8(row + x - 1);
+        uint8x16_t eq = vceqq_u8(cur, prv);
+        uint64_t chg = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        while (chg) {
+            int b = __builtin_ctzll(chg) >> 2;
+            chg &= ~(0xfull << (4*b));
+            int cx = x + b;
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = cx - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = cx;
+            v = row[cx];
+        }
+    }
 #endif
 
     for (; x <= xmax; x++) {
@@ -1715,6 +1738,18 @@ static int rle_row_count(const uint8_t *row, int w)
         uint32_t chg = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, prv));
         uint32_t n127 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, v127));
         count += __builtin_popcount(chg & n127);
+    }
+#elif defined(__ARM_NEON)
+    const uint8x16_t v127 = vdupq_n_u8(127);
+    for (; x + 16 <= xmax + 1; x += 16) {
+        uint8x16_t cur = vld1q_u8(row + x);
+        uint8x16_t prv = vld1q_u8(row + x - 1);
+        // nibble masks: a qualifying byte contributes 4 set bits
+        uint64_t chg = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8(cur, prv)), 4)), 0);
+        uint64_t n127 = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8(cur, v127)), 4)), 0);
+        count += __builtin_popcountll(chg & n127) >> 2;
     }
 #endif
 
