@@ -1,0 +1,2 @@
+commit	label	threshold_ms	unionfind_ms	make_clusters_ms	fit_quads_ms	quads_ms	decode_refine_ms	other_ms	total_detector_ms	wall_mean_ms	wall_stddev_ms	description
+cdb964d	baseline	3.126	2.891	8.758	12.463	0.001	1.740	0.038	29.017	6281.5	555.0	scalar arm64 baseline (no SIMD; AVX2 paths inactive)
