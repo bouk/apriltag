@@ -85,6 +85,32 @@ detections, coords within 1e-4 px — FMA contraction noise only).
 - No duplicate cluster points exist (measured) — nothing to dedup.
 - No over-cap fragments exist (measured) — nothing to truncate early.
 
+## arm64/NEON port (Apple M3 Pro, vide_images2, 4 threads)
+
+All 14 AVX2 blocks have NEON counterparts (`#elif defined(__ARM_NEON)`),
+output byte-identical to the scalar arm64 build at every commit
+(4583/4583 detections). 29.0 -> 25.0 ms/image detector total (-14%);
+per-commit stage timings in `results.tsv`.
+
+- Measure with `./bench_neon.sh <label> [desc]` (hyperfine wall +
+  per-stage table, appends to results.tsv) and `./check_neon.sh`
+  (epsilon-gated equivalence vs benchmark_results/dets-baseline.tsv).
+  The machine is shared: bench_neon.sh waits for a quiet 1-min load
+  window (LOAD_MAX, default 5.0; 3.0 gives trustworthy numbers).
+  Runs taken under load inflate *untouched* stages — that's the tell.
+- NEON niceties vs the AVX2 originals: vld4 deinterleaves struct pt
+  for free (no blend/permute dance in the key loop); vshrn-narrowed
+  nibble masks replace movemask (each byte yields 4 mask bits, so
+  ctz>>2 and popcount>>2); vpmin/vpmax pairs collapse the 4x4 tile
+  reduction; true u8 shifts drop the AVX2 0x7f masking.
+- The NEON gains are smaller than the x86 ones mostly because 128-bit
+  lanes halve the width, and the scalar arm64 baseline was already
+  relatively faster than scalar x86 (the M3's OoO core hides more).
+- Measured dead end: widening the 2-wide f64 loops to 4-wide with two
+  independent chains (window errors, bbox) is ~2% *worse* on fit
+  quads, reproducibly — the OoO engine already overlaps iterations;
+  the wider body just adds register pressure.
+
 ## Where the remaining time is (quiet, pinned, 39.8 total)
 
 threshold 1.7 · unionfind 4.7 · make clusters 14.0 · fit quads ~14 ·
