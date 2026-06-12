@@ -1,0 +1,958 @@
+// AprilTag detector GPU front-end: threshold -> RLE -> run-indexed
+// connected components -> label paint -> boundary point emission ->
+// stable group-by-cluster. Mirrors the CPU pipeline in
+// apriltag_quad_thresh.c exactly (integer arithmetic throughout); see
+// METAL_NOTES.md for the semantics contract.
+#include <metal_stdlib>
+using namespace metal;
+
+#define INVALID_LABEL 0xFFFFFFFFu
+
+// overflow flag bits in ATState.overflow
+#define OV_RUNS     1u
+#define OV_RECORDS  2u
+#define OV_COMPS    4u
+#define OV_CLUSTERS 8u
+
+struct ATParams {
+    uint w, h, s;            // image width/height/stride
+    uint tw, th;             // tile grid
+    uint min_wb_diff;        // qtp.min_white_black_diff
+    uint min_cluster_pixels; // component-size gate
+    uint runs_cap;
+    uint records_cap;
+    uint comps_cap;          // must be <= 32768 (pair key packs 2x15 bits)
+    uint clusters_cap;
+    uint emit_blocks_x;      // ceil(w/256)
+};
+
+struct ATState {
+    uint nruns;       // row_off[h]
+    uint nnodes;      // nruns + h (virtual last-column node per row)
+    uint ncomp;       // usable (size-gated) components
+    uint nrecords;
+    uint nclusters;
+    atomic_uint overflow;
+    // indirect dispatch args (threadgroup counts)
+    uint runs_tg[3];
+    uint nodes_tg[3];
+    uint rec_tg[3];   // ceil(nrecords/256)
+    uint radix_tg[3]; // ceil(nrecords/RADIX_BLOCK)
+    uint cl_tg[3];    // ceil(nclusters/256)
+};
+
+// 8-byte GPU run record (CPU's row_run + row index)
+struct gpu_run {
+    ushort start, end; // inclusive
+    ushort y;
+    uchar v;
+    uchar pad;
+};
+
+// packed boundary point, identical layout to struct pt
+struct gpu_pt {
+    ushort x, y;
+    short gx, gy;
+};
+
+///////////////////////////////////////////////////////////////////////////
+// stage 1: threshold
+
+kernel void k_minmax(device const uchar *im [[buffer(0)]],
+                     device uchar *tmin [[buffer(1)]],
+                     device uchar *tmax [[buffer(2)]],
+                     constant ATParams &p [[buffer(3)]],
+                     uint2 g [[thread_position_in_grid]])
+{
+    if (g.x >= p.tw || g.y >= p.th)
+        return;
+    uchar mn = 255, mx = 0;
+    for (uint dy = 0; dy < 4; dy++) {
+        uint off = (g.y*4 + dy)*p.s + g.x*4;
+        for (uint dx = 0; dx < 4; dx++) {
+            uchar v = im[off + dx];
+            mn = min(mn, v);
+            mx = max(mx, v);
+        }
+    }
+    tmin[g.y*p.tw + g.x] = mn;
+    tmax[g.y*p.tw + g.x] = mx;
+}
+
+kernel void k_blur(device const uchar *tmin [[buffer(0)]],
+                   device const uchar *tmax [[buffer(1)]],
+                   device uchar *bmin [[buffer(2)]],
+                   device uchar *bmax [[buffer(3)]],
+                   constant ATParams &p [[buffer(4)]],
+                   uint2 g [[thread_position_in_grid]])
+{
+    if (g.x >= p.tw || g.y >= p.th)
+        return;
+    uchar mn = 255, mx = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        int ty = (int)g.y + dy;
+        if (ty < 0 || ty >= (int)p.th)
+            continue;
+        for (int dx = -1; dx <= 1; dx++) {
+            int tx = (int)g.x + dx;
+            if (tx < 0 || tx >= (int)p.tw)
+                continue;
+            mn = min(mn, tmin[ty*p.tw + tx]);
+            mx = max(mx, tmax[ty*p.tw + tx]);
+        }
+    }
+    bmin[g.y*p.tw + g.x] = mn;
+    bmax[g.y*p.tw + g.x] = mx;
+}
+
+// one thread per pixel; replicates the CPU edge semantics:
+// - full-tile pixels: 127 on low contrast, else 0/255
+// - right-edge / bottom-tail pixels: clamped tile, always 0/255
+kernel void k_threshold(device const uchar *im [[buffer(0)]],
+                        device const uchar *bmin [[buffer(1)]],
+                        device const uchar *bmax [[buffer(2)]],
+                        device uchar *out [[buffer(3)]],
+                        constant ATParams &p [[buffer(4)]],
+                        uint2 g [[thread_position_in_grid]])
+{
+    if (g.x >= p.w || g.y >= p.h)
+        return;
+    uint tx = min(g.x/4, p.tw - 1);
+    uint ty = min(g.y/4, p.th - 1);
+    int mn = bmin[ty*p.tw + tx];
+    int mx = bmax[ty*p.tw + tx];
+    bool in_tiles = (g.x < p.tw*4) && (g.y < p.th*4);
+    uchar v = im[g.y*p.s + g.x];
+    uchar r;
+    if (in_tiles && (mx - mn < (int)p.min_wb_diff)) {
+        r = 127;
+    } else {
+        int thresh = mn + (mx - mn)/2;
+        r = (v > (uchar)thresh) ? 255 : 0;
+    }
+    out[g.y*p.s + g.x] = r;
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 2: RLE (one thread per row; rows are independent)
+
+// count runs in row y over x in [0, w-2], skipping 127 spans
+kernel void k_rle_count(device const uchar *t [[buffer(0)]],
+                        device uint *row_off [[buffer(1)]],
+                        constant ATParams &p [[buffer(2)]],
+                        uint y [[thread_position_in_grid]])
+{
+    if (y >= p.h)
+        return;
+    device const uchar *row = t + y*p.s;
+    int xmax = (int)p.w - 2;
+    uint count = (row[0] != 127) ? 1u : 0u;
+    for (int x = 1; x <= xmax; x++)
+        count += (row[x] != row[x-1] && row[x] != 127) ? 1u : 0u;
+    row_off[y + 1] = count;
+}
+
+// single-threadgroup exclusive scan of row counts -> row offsets;
+// thread 0 finalizes state (nruns, nnodes, indirect args, overflow)
+kernel void k_scan_rows(device uint *row_off [[buffer(0)]],
+                        device ATState *st [[buffer(1)]],
+                        constant ATParams &p [[buffer(2)]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint tsz [[threads_per_threadgroup]])
+{
+    threadgroup uint partials[256];
+    threadgroup uint carry;
+    uint n = p.h; // entries row_off[1..h]
+    uint chunk = (n + tsz - 1) / tsz;
+    uint lo = 1 + tid*chunk;
+    uint hi = min(1 + (tid + 1)*chunk, n + 1);
+
+    uint sum = 0;
+    for (uint i = lo; i < hi; i++)
+        sum += row_off[i];
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < tsz; i++) {
+            uint v = partials[i];
+            partials[i] = acc;
+            acc += v;
+        }
+        carry = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // inclusive prefix: row_off[i] = total runs of rows 0..i-1
+    uint acc = partials[tid];
+    for (uint i = lo; i < hi; i++) {
+        acc += row_off[i];
+        row_off[i] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        row_off[0] = 0;
+        uint nruns = carry;
+        st->nruns = nruns;
+        st->nnodes = nruns + p.h;
+        if (nruns > p.runs_cap)
+            atomic_fetch_or_explicit(&st->overflow, OV_RUNS, memory_order_relaxed);
+        st->runs_tg[0] = (nruns + 255) / 256;
+        st->runs_tg[1] = 1;
+        st->runs_tg[2] = 1;
+        st->nodes_tg[0] = (nruns + p.h + 255) / 256;
+        st->nodes_tg[1] = 1;
+        st->nodes_tg[2] = 1;
+    }
+}
+
+kernel void k_rle_fill(device const uchar *t [[buffer(0)]],
+                       device const uint *row_off [[buffer(1)]],
+                       device gpu_run *runs [[buffer(2)]],
+                       constant ATParams &p [[buffer(3)]],
+                       uint y [[thread_position_in_grid]])
+{
+    if (y >= p.h)
+        return;
+    device const uchar *row = t + y*p.s;
+    uint o = row_off[y];
+    if (o >= p.runs_cap)
+        return; // overflow already flagged
+    int xmax = (int)p.w - 2;
+    int start = 0;
+    uchar v = row[0];
+    for (int x = 1; x <= xmax; x++) {
+        if (row[x] != v) {
+            if (v != 127 && o < p.runs_cap) {
+                runs[o].start = (ushort)start;
+                runs[o].end = (ushort)(x - 1);
+                runs[o].y = (ushort)y;
+                runs[o].v = v;
+                runs[o].pad = 0;
+                o++;
+            }
+            start = x;
+            v = row[x];
+        }
+    }
+    if (v != 127 && o < p.runs_cap) {
+        runs[o].start = (ushort)start;
+        runs[o].end = (ushort)xmax;
+        runs[o].y = (ushort)y;
+        runs[o].v = v;
+        runs[o].pad = 0;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 3: union-find over runs
+
+static inline uint uf_find(device atomic_uint *parent, uint i)
+{
+#ifdef AT_UF_PATH_HALVING
+    uint p = atomic_load_explicit(&parent[i], memory_order_relaxed);
+    while (p != i) {
+        uint pp = atomic_load_explicit(&parent[p], memory_order_relaxed);
+        if (pp != p) {
+            // path halving; benign race
+            atomic_store_explicit(&parent[i], pp, memory_order_relaxed);
+        }
+        i = p;
+        p = pp;
+    }
+    return i;
+#else
+    uint p = atomic_load_explicit(&parent[i], memory_order_relaxed);
+    while (p != i) {
+        i = p;
+        p = atomic_load_explicit(&parent[i], memory_order_relaxed);
+    }
+    return i;
+#endif
+}
+
+static inline void uf_union(device atomic_uint *parent, uint a, uint b)
+{
+    for (;;) {
+        a = uf_find(parent, a);
+        b = uf_find(parent, b);
+        if (a == b)
+            return;
+        uint hi = max(a, b), lo = min(a, b);
+        uint expected = hi;
+        // weak CAS can fail spuriously; retry from the (possibly updated)
+        // roots either way
+        if (atomic_compare_exchange_weak_explicit(&parent[hi], &expected, lo,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return;
+        a = lo;
+        b = hi;
+    }
+}
+
+kernel void k_uf_init(device atomic_uint *parent [[buffer(0)]],
+                      device const ATState *st [[buffer(1)]],
+                      uint i [[thread_position_in_grid]])
+{
+    if (i < st->nnodes)
+        atomic_store_explicit(&parent[i], i, memory_order_relaxed);
+}
+
+// one thread per run: connect to the previous row's runs exactly per
+// connect_runs_to_prev() (vertical contact clamped to x>=1; white also
+// diagonal; white run ending at w-2 may connect the previous row's
+// virtual last-column node)
+kernel void k_uf_connect(device atomic_uint *parent [[buffer(0)]],
+                         device const gpu_run *runs [[buffer(1)]],
+                         device const uint *row_off [[buffer(2)]],
+                         device const uchar *t [[buffer(3)]],
+                         device const ATState *st [[buffer(4)]],
+                         constant ATParams &p [[buffer(5)]],
+                         uint ri [[thread_position_in_grid]])
+{
+    if (ri >= st->nruns)
+        return;
+    gpu_run r = runs[ri];
+    uint y = r.y;
+    if (y == 0)
+        return;
+
+    int a0 = r.start, a1 = r.end;
+    uchar v = r.v;
+    uint prev_lo = row_off[y - 1], prev_hi = row_off[y];
+
+    // first candidate: lowest k with prev[k].end + 1 >= a0 (ends ascend)
+    uint klo = prev_lo, khi = prev_hi;
+    while (klo < khi) {
+        uint mid = (klo + khi)/2;
+        if ((int)runs[mid].end + 1 < a0)
+            klo = mid + 1;
+        else
+            khi = mid;
+    }
+
+    for (uint k = klo; k < prev_hi && (int)runs[k].start <= a1 + 1; k++) {
+        if (runs[k].v != v)
+            continue;
+        int b0 = runs[k].start, b1 = runs[k].end;
+
+        int lo = max(max(a0, b0), 1);
+        int hi = min(a1, b1);
+        if (lo <= hi) {
+            uf_union(parent, ri, k);
+        } else if (v == 255) {
+            int xl = max(max(a0, b0 + 1), 1);
+            if (xl <= min(a1, b1 + 1)) {
+                uf_union(parent, ri, k);
+            } else {
+                int xr = max(max(a0, b0 - 1), 1);
+                if (xr <= min(a1, b1 - 1)) {
+                    uf_union(parent, ri, k);
+                }
+            }
+        }
+    }
+
+    if (v == 255 && a1 == (int)p.w - 2 &&
+        t[(y - 1)*p.s + (p.w - 1)] == 255 &&
+        t[(y - 1)*p.s + (p.w - 2)] != 255) {
+        uf_union(parent, ri, st->nruns + (y - 1));
+    }
+}
+
+kernel void k_uf_flatten(device atomic_uint *parent [[buffer(0)]],
+                         device const ATState *st [[buffer(1)]],
+                         uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nnodes)
+        return;
+    uint root = uf_find(parent, i);
+    atomic_store_explicit(&parent[i], root, memory_order_relaxed);
+}
+
+// component pixel counts at roots: runs add their length, virtual
+// last-column nodes add 1
+kernel void k_comp_count(device const uint *parent [[buffer(0)]],
+                         device atomic_uint *count [[buffer(1)]],
+                         device const gpu_run *runs [[buffer(2)]],
+                         device const ATState *st [[buffer(3)]],
+                         uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nnodes)
+        return;
+    uint add = 1;
+    if (i < st->nruns)
+        add = (uint)(runs[i].end - runs[i].start + 1);
+    atomic_fetch_add_explicit(&count[parent[i]], add, memory_order_relaxed);
+}
+
+kernel void k_zero_u32(device uint *buf [[buffer(0)]],
+                       device const ATState *st [[buffer(1)]],
+                       uint i [[thread_position_in_grid]])
+{
+    if (i < st->nnodes)
+        buf[i] = 0;
+}
+
+// flag usable roots (component pixel count >= min_cluster_pixels)
+kernel void k_root_flag(device const uint *parent [[buffer(0)]],
+                        device const uint *count [[buffer(1)]],
+                        device uint *flag [[buffer(2)]],
+                        device const ATState *st [[buffer(3)]],
+                        constant ATParams &p [[buffer(4)]],
+                        uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nnodes)
+        return;
+    flag[i] = (parent[i] == i && count[i] >= p.min_cluster_pixels) ? 1u : 0u;
+}
+
+// single-threadgroup exclusive scan over node flags -> dense component ids
+// (deterministic: rank among usable roots in node-index order)
+kernel void k_scan_nodes(device uint *flag_then_dense [[buffer(0)]],
+                         device ATState *st [[buffer(1)]],
+                         constant ATParams &p [[buffer(2)]],
+                         uint tid [[thread_position_in_threadgroup]],
+                         uint tsz [[threads_per_threadgroup]])
+{
+    threadgroup uint partials[256];
+    threadgroup uint total;
+    uint n = st->nnodes;
+    uint chunk = (n + tsz - 1) / tsz;
+    uint lo = tid*chunk;
+    uint hi = min(lo + chunk, n);
+
+    uint sum = 0;
+    for (uint i = lo; i < hi; i++)
+        sum += flag_then_dense[i];
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < tsz; i++) {
+            uint v = partials[i];
+            partials[i] = acc;
+            acc += v;
+        }
+        total = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint acc = partials[tid];
+    for (uint i = lo; i < hi; i++) {
+        uint v = flag_then_dense[i];
+        flag_then_dense[i] = acc;
+        acc += v;
+    }
+
+    if (tid == 0) {
+        st->ncomp = total;
+        if (total > p.comps_cap)
+            atomic_fetch_or_explicit(&st->overflow, OV_COMPS, memory_order_relaxed);
+    }
+}
+
+// per-node label: dense id of its root when usable, else INVALID
+kernel void k_node_label(device const uint *parent [[buffer(0)]],
+                         device const uint *count [[buffer(1)]],
+                         device const uint *dense [[buffer(2)]],
+                         device uint *node_label [[buffer(3)]],
+                         device const ATState *st [[buffer(4)]],
+                         constant ATParams &p [[buffer(5)]],
+                         uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nnodes)
+        return;
+    uint root = parent[i];
+    node_label[i] = (count[root] >= p.min_cluster_pixels) ? dense[root] : INVALID_LABEL;
+}
+
+kernel void k_label_clear(device uint *labels [[buffer(0)]],
+                          constant ATParams &p [[buffer(1)]],
+                          uint i [[thread_position_in_grid]])
+{
+    if (i < p.w*p.h)
+        labels[i] = INVALID_LABEL;
+}
+
+// paint per-pixel labels: each run paints its span; each virtual node
+// paints its last-column pixel
+kernel void k_label_paint(device const uint *node_label [[buffer(0)]],
+                          device const gpu_run *runs [[buffer(1)]],
+                          device uint *labels [[buffer(2)]],
+                          device const ATState *st [[buffer(3)]],
+                          constant ATParams &p [[buffer(4)]],
+                          uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nnodes)
+        return;
+    uint lbl = node_label[i];
+    if (lbl == INVALID_LABEL)
+        return;
+    if (i < st->nruns) {
+        gpu_run r = runs[i];
+        device uint *row = labels + (uint)r.y*p.w;
+        for (uint x = r.start; x <= (uint)r.end; x++)
+            row[x] = lbl;
+    } else {
+        uint y = i - st->nruns;
+        labels[y*p.w + (p.w - 1)] = lbl;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 4: boundary point emission
+//
+// Per pixel (x in [1, w-2], y in [0, h-2]), connections in legacy order
+// (1,0), (0,1), (-1,1), (1,1). A connection fires iff v0 + v1 == 255 and
+// both pixels carry valid labels. The (-1,1) connection is suppressed when
+// pixel x-1 fired its (1,1) (recomputed locally, no serial state).
+
+static inline uint emit_mask(device const uchar *t, device const uint *labels,
+                             constant ATParams &p, uint x, uint y)
+{
+    uchar v0 = t[y*p.s + x];
+    if (v0 == 127)
+        return 0;
+    uint l0 = labels[y*p.w + x];
+    if (l0 == INVALID_LABEL)
+        return 0;
+
+    uint mask = 0;
+    // (1,0)
+    {
+        uchar v1 = t[y*p.s + x + 1];
+        if ((uint)v0 + v1 == 255 && labels[y*p.w + x + 1] != INVALID_LABEL)
+            mask |= 1;
+    }
+    // (0,1)
+    {
+        uchar v1 = t[(y + 1)*p.s + x];
+        if ((uint)v0 + v1 == 255 && labels[(y + 1)*p.w + x] != INVALID_LABEL)
+            mask |= 2;
+    }
+    // (-1,1), unless the left neighbor fired its (1,1)
+    {
+        bool suppressed = false;
+        if (x >= 2) {
+            uchar vp = t[y*p.s + x - 1];
+            uchar vd = t[(y + 1)*p.s + x];
+            suppressed = (vp != 127) && ((uint)vp + vd == 255) &&
+                         labels[y*p.w + x - 1] != INVALID_LABEL &&
+                         labels[(y + 1)*p.w + x] != INVALID_LABEL;
+        }
+        if (!suppressed) {
+            uchar v1 = t[(y + 1)*p.s + x - 1];
+            if ((uint)v0 + v1 == 255 && labels[(y + 1)*p.w + x - 1] != INVALID_LABEL)
+                mask |= 4;
+        }
+    }
+    // (1,1)
+    {
+        uchar v1 = t[(y + 1)*p.s + x + 1];
+        if ((uint)v0 + v1 == 255 && labels[(y + 1)*p.w + x + 1] != INVALID_LABEL)
+            mask |= 8;
+    }
+    return mask;
+}
+
+// per-block point counts; one threadgroup covers 256 consecutive pixels
+// of one row
+kernel void k_emit_count(device const uchar *t [[buffer(0)]],
+                         device const uint *labels [[buffer(1)]],
+                         device uint *block_counts [[buffer(2)]],
+                         constant ATParams &p [[buffer(3)]],
+                         uint2 gid [[threadgroup_position_in_grid]],
+                         uint2 tid2 [[thread_position_in_threadgroup]])
+{
+    uint tid = tid2.x;
+    threadgroup atomic_uint tg_count;
+    if (tid == 0)
+        atomic_store_explicit(&tg_count, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint x = gid.x*256 + tid;
+    uint y = gid.y;
+    uint c = 0;
+    if (x >= 1 && x <= p.w - 2 && y <= p.h - 2)
+        c = popcount(emit_mask(t, labels, p, x, y));
+    if (c)
+        atomic_fetch_add_explicit(&tg_count, c, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0)
+        block_counts[gid.y*p.emit_blocks_x + gid.x] =
+            atomic_load_explicit(&tg_count, memory_order_relaxed);
+}
+
+// single-threadgroup exclusive scan of block counts; finalizes nrecords
+// and the record-indexed indirect args
+#define RADIX_BLOCK 1024u
+kernel void k_scan_blocks(device uint *block_counts [[buffer(0)]],
+                          device ATState *st [[buffer(1)]],
+                          constant ATParams &p [[buffer(2)]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint tsz [[threads_per_threadgroup]])
+{
+    threadgroup uint partials[256];
+    threadgroup uint total;
+    uint n = p.emit_blocks_x * p.h;
+    uint chunk = (n + tsz - 1) / tsz;
+    uint lo = tid*chunk;
+    uint hi = min(lo + chunk, n);
+
+    uint sum = 0;
+    for (uint i = lo; i < hi; i++)
+        sum += block_counts[i];
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < tsz; i++) {
+            uint v = partials[i];
+            partials[i] = acc;
+            acc += v;
+        }
+        total = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint acc = partials[tid];
+    for (uint i = lo; i < hi; i++) {
+        uint v = block_counts[i];
+        block_counts[i] = acc;
+        acc += v;
+    }
+
+    if (tid == 0) {
+        st->nrecords = total;
+        if (total > p.records_cap)
+            atomic_fetch_or_explicit(&st->overflow, OV_RECORDS, memory_order_relaxed);
+        st->rec_tg[0] = (total + 255)/256;
+        st->rec_tg[1] = 1;
+        st->rec_tg[2] = 1;
+        st->radix_tg[0] = (total + RADIX_BLOCK - 1)/RADIX_BLOCK;
+        st->radix_tg[1] = 1;
+        st->radix_tg[2] = 1;
+    }
+}
+
+// ordered scatter: same traversal as k_emit_count, but writes
+// {key, pt} records at exact offsets, preserving the legacy
+// (y, x, conn) order
+kernel void k_emit_scatter(device const uchar *t [[buffer(0)]],
+                           device const uint *labels [[buffer(1)]],
+                           device const uint *block_offsets [[buffer(2)]],
+                           device uint *keys [[buffer(3)]],
+                           device gpu_pt *pts [[buffer(4)]],
+                           constant ATParams &p [[buffer(5)]],
+                           uint2 gid [[threadgroup_position_in_grid]],
+                           uint2 tid2 [[thread_position_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]])
+{
+    uint tid = tid2.x;
+    threadgroup uint sg_totals[8];
+
+    uint x = gid.x*256 + tid;
+    uint y = gid.y;
+    uint mask = 0;
+    if (x >= 1 && x <= p.w - 2 && y <= p.h - 2)
+        mask = emit_mask(t, labels, p, x, y);
+    uint c = popcount(mask);
+
+    // threadgroup-ordered exclusive prefix of c (simd, then simdgroups)
+    uint pre = simd_prefix_exclusive_sum(c);
+    if (lane == 31)
+        sg_totals[sg] = pre + c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint v = (lane < 8) ? sg_totals[lane] : 0;
+        uint pv = simd_prefix_exclusive_sum(v);
+        if (lane < 8)
+            sg_totals[lane] = pv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint base = block_offsets[gid.y*p.emit_blocks_x + gid.x] + sg_totals[sg] + pre;
+
+    if (!mask || base >= p.records_cap)
+        return;
+
+    uint l0 = labels[y*p.w + x];
+    uint o = base;
+    // conn order: (1,0), (0,1), (-1,1), (1,1)
+    const int dxs[4] = {1, 0, -1, 1};
+    const int dys[4] = {0, 1, 1, 1};
+    uchar v0 = t[y*p.s + x];
+    int vdiff_white = 255 - 2*(int)v0; // v1 - v0 for opposite pair
+    for (uint conn = 0; conn < 4; conn++) {
+        if (!(mask & (1u << conn)))
+            continue;
+        int dx = dxs[conn], dy = dys[conn];
+        uint l1 = labels[(y + dy)*p.w + (x + dx)];
+        uint kmin = min(l0, l1), kmax = max(l0, l1);
+        uint key = (kmin << 15) | kmax; // comps_cap <= 32768
+        if (o < p.records_cap) {
+            keys[o] = key;
+            gpu_pt q;
+            q.x = (ushort)(2*x + dx);
+            q.y = (ushort)(2*y + dy);
+            q.gx = (short)(dx*vdiff_white);
+            q.gy = (short)(dy*vdiff_white);
+            pts[o] = q;
+        }
+        o++;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 5: stable LSD radix sort of records by 30-bit key, 5 bits/pass
+
+#define RADIX_BITS 5u
+#define RADIX_BINS 32u
+#define RADIX_EPT 4u // elements per thread; 256 threads -> 1024 per block
+
+kernel void k_radix_hist(device const uint *keys [[buffer(0)]],
+                         device uint *hist [[buffer(1)]], // [bin][block]
+                         device const ATState *st [[buffer(2)]],
+                         constant uint &shift [[buffer(3)]],
+                         uint b [[threadgroup_position_in_grid]],
+                         uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup atomic_uint local_hist[RADIX_BINS];
+    if (tid < RADIX_BINS)
+        atomic_store_explicit(&local_hist[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint n = st->nrecords;
+    uint base = b*RADIX_BLOCK + tid*RADIX_EPT;
+    for (uint i = 0; i < RADIX_EPT; i++) {
+        uint idx = base + i;
+        if (idx < n) {
+            uint d = (keys[idx] >> shift) & (RADIX_BINS - 1);
+            atomic_fetch_add_explicit(&local_hist[d], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint nblocks = st->radix_tg[0];
+    if (tid < RADIX_BINS)
+        hist[tid*nblocks + b] =
+            atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
+}
+
+kernel void k_radix_scan(device uint *hist [[buffer(0)]],
+                         device const ATState *st [[buffer(1)]],
+                         uint tid [[thread_position_in_threadgroup]],
+                         uint tsz [[threads_per_threadgroup]])
+{
+    threadgroup uint partials[256];
+    uint n = RADIX_BINS * st->radix_tg[0];
+    uint chunk = (n + tsz - 1) / tsz;
+    uint lo = tid*chunk;
+    uint hi = min(lo + chunk, n);
+
+    uint sum = 0;
+    for (uint i = lo; i < hi; i++)
+        sum += hist[i];
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < tsz; i++) {
+            uint v = partials[i];
+            partials[i] = acc;
+            acc += v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint acc = partials[tid];
+    for (uint i = lo; i < hi; i++) {
+        uint v = hist[i];
+        hist[i] = acc;
+        acc += v;
+    }
+}
+
+// stable scatter: per-block ranks via a [thread][bin] u16 matrix
+kernel void k_radix_scatter(device const uint *keys_in [[buffer(0)]],
+                            device const gpu_pt *pts_in [[buffer(1)]],
+                            device uint *keys_out [[buffer(2)]],
+                            device gpu_pt *pts_out [[buffer(3)]],
+                            device const uint *hist [[buffer(4)]],
+                            device const ATState *st [[buffer(5)]],
+                            constant uint &shift [[buffer(6)]],
+                            uint b [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup ushort m[256][RADIX_BINS]; // 16 KB
+    uint n = st->nrecords;
+    uint base = b*RADIX_BLOCK + tid*RADIX_EPT;
+
+    uint my_keys[RADIX_EPT];
+    uint my_digit[RADIX_EPT];
+    ushort counts[RADIX_BINS];
+    for (uint d = 0; d < RADIX_BINS; d++)
+        counts[d] = 0;
+    for (uint i = 0; i < RADIX_EPT; i++) {
+        uint idx = base + i;
+        if (idx < n) {
+            my_keys[i] = keys_in[idx];
+            uint d = (my_keys[i] >> shift) & (RADIX_BINS - 1);
+            my_digit[i] = d;
+            counts[d]++;
+        } else {
+            my_digit[i] = RADIX_BINS; // sentinel
+        }
+    }
+    for (uint d = 0; d < RADIX_BINS; d++)
+        m[tid][d] = counts[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // exclusive column scans across the 256 threads (Hillis-Steele)
+    for (uint off = 1; off < 256; off <<= 1) {
+        ushort vals[RADIX_BINS];
+        if (tid >= off)
+            for (uint d = 0; d < RADIX_BINS; d++)
+                vals[d] = m[tid - off][d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid >= off)
+            for (uint d = 0; d < RADIX_BINS; d++)
+                m[tid][d] += vals[d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // m[tid][d] is now the inclusive prefix; exclusive = inclusive - own
+    uint nblocks = st->radix_tg[0];
+    uint prior[RADIX_BINS];
+    for (uint d = 0; d < RADIX_BINS; d++)
+        prior[d] = (uint)m[tid][d] - counts[d];
+
+    uint seen[RADIX_BINS];
+    for (uint d = 0; d < RADIX_BINS; d++)
+        seen[d] = 0;
+    for (uint i = 0; i < RADIX_EPT; i++) {
+        uint d = my_digit[i];
+        if (d >= RADIX_BINS)
+            continue;
+        uint pos = hist[d*nblocks + b] + prior[d] + seen[d];
+        seen[d]++;
+        keys_out[pos] = my_keys[i];
+        pts_out[pos] = pts_in[base + i];
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 6: cluster bounds + arena layout
+//
+// Single threadgroup; three sequential phases over the sorted records:
+// 1) flag cluster starts, 2) scan flags -> cluster index per record +
+// starts[], 3) compute arena offsets (8-byte header + 8 bytes per point).
+
+kernel void k_cluster_bounds(device const uint *keys [[buffer(0)]],
+                             device uint *c_of [[buffer(1)]],
+                             device uint *starts [[buffer(2)]],
+                             device uint *arena_off [[buffer(3)]],
+                             device ATState *st [[buffer(4)]],
+                             constant ATParams &p [[buffer(5)]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint tsz [[threads_per_threadgroup]])
+{
+    threadgroup uint partials[256];
+    threadgroup uint total;
+    uint n = st->nrecords;
+    uint chunk = (n + tsz - 1) / tsz;
+    uint lo = tid*chunk;
+    uint hi = min(lo + chunk, n);
+
+    // phase 1+2 fused: each thread serially scans its chunk twice
+    uint sum = 0;
+    for (uint i = lo; i < hi; i++)
+        sum += (i == 0 || keys[i] != keys[i-1]) ? 1u : 0u;
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < tsz; i++) {
+            uint v = partials[i];
+            partials[i] = acc;
+            acc += v;
+        }
+        total = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint cidx = partials[tid];
+    for (uint i = lo; i < hi; i++) {
+        if (i == 0 || keys[i] != keys[i-1]) {
+            if (cidx < p.clusters_cap)
+                starts[cidx] = i;
+            cidx++;
+        }
+        c_of[i] = cidx - 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint ncl = total;
+    if (tid == 0) {
+        st->nclusters = ncl;
+        if (ncl > p.clusters_cap)
+            atomic_fetch_or_explicit(&st->overflow, OV_CLUSTERS, memory_order_relaxed);
+        st->cl_tg[0] = (ncl + 255)/256;
+        st->cl_tg[1] = 1;
+        st->cl_tg[2] = 1;
+        starts[min(ncl, p.clusters_cap)] = n; // sentinel for size computation
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // arena offset for cluster c = 8*c + 8*starts[c]
+    uint ncl_c = min(ncl, p.clusters_cap);
+    uint chunk2 = (ncl_c + tsz - 1) / tsz;
+    uint lo2 = tid*chunk2;
+    uint hi2 = min(lo2 + chunk2, ncl_c);
+    for (uint c = lo2; c < hi2; c++)
+        arena_off[c] = 8*c + 8*starts[c];
+}
+
+// per-cluster header {size, pad}
+kernel void k_arena_headers(device const uint *starts [[buffer(0)]],
+                            device const uint *arena_off [[buffer(1)]],
+                            device uint *arena [[buffer(2)]],
+                            device const ATState *st [[buffer(3)]],
+                            constant ATParams &p [[buffer(4)]],
+                            uint c [[thread_position_in_grid]])
+{
+    uint ncl = min(st->nclusters, p.clusters_cap);
+    if (c >= ncl)
+        return;
+    uint off = arena_off[c] / 4;
+    arena[off] = starts[c + 1] - starts[c]; // size
+    arena[off + 1] = 0;                     // pad
+}
+
+// per-record point copy into the arena
+kernel void k_arena_scatter(device const gpu_pt *pts [[buffer(0)]],
+                            device const uint *c_of [[buffer(1)]],
+                            device const uint *starts [[buffer(2)]],
+                            device const uint *arena_off [[buffer(3)]],
+                            device gpu_pt *arena [[buffer(4)]],
+                            device const ATState *st [[buffer(5)]],
+                            constant ATParams &p [[buffer(6)]],
+                            uint i [[thread_position_in_grid]])
+{
+    if (i >= st->nrecords)
+        return;
+    uint c = c_of[i];
+    if (c >= p.clusters_cap)
+        return;
+    uint rank = i - starts[c];
+    // arena_off is in bytes; header is 8 bytes, then 8-byte points
+    uint slot = arena_off[c]/8 + 1 + rank;
+    arena[slot] = pts[i];
+}

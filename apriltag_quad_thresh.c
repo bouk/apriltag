@@ -36,6 +36,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include <stdint.h>
 
 #include "apriltag.h"
+#include "apriltag_quad_internal.h"
+#ifdef APRILTAG_METAL_ENABLED
+#include "apriltag_metal.h"
+#endif
 #include "common/image_u8x3.h"
 #include "common/zarray.h"
 #include "common/unionfind.h"
@@ -70,20 +74,8 @@ struct uint64_zarray_entry
     struct uint64_zarray_entry *next;
 };
 
-struct pt
-{
-    // Note: these represent 2*actual value.
-    uint16_t x, y;
-    int16_t gx, gy;
-};
-
-// a finished cluster: header and points in one allocation
-struct pt_list
-{
-    int size;
-    int pad; // keep pts 8-byte aligned
-    struct pt pts[];
-};
+// struct pt and struct pt_list live in apriltag_quad_internal.h (shared
+// with the GPU modules)
 
 // Cluster points are accumulated in fixed-size chunks bump-allocated from
 // a per-task pool: appending is a bounds check and a store, with none of
@@ -2200,8 +2192,10 @@ static void do_quad_task(void *p)
         }
 
         // destroy here, in parallel and while cache-warm, rather than in
-        // a serial loop after all quad tasks finish
-        free(*cluster);
+        // a serial loop after all quad tasks finish. (Metal-produced
+        // clusters live in a GPU arena owned by the metal context.)
+        if (!td->metal)
+            free(*cluster);
         *cluster = NULL;
     }
 
@@ -3799,6 +3793,19 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     // step 1. threshold the image, creating the edge image.
 
     int w = im->width, h = im->height;
+
+#ifdef APRILTAG_METAL_ENABLED
+    if (td->metal && !td->qtp.deglitch && !td->debug) {
+        // GPU front-end: threshold + connected components + clustering.
+        // The clusters' allocations are owned by the metal context;
+        // do_quad_task skips the per-cluster free when td->metal is set.
+        zarray_t *clusters = apriltag_metal_clusters(td->metal, td, im);
+        zarray_t *quads = fit_quads(td, w, h, clusters, im);
+        timeprofile_stamp(td->tp, "fit quads to clusters");
+        zarray_destroy(clusters);
+        return quads;
+    }
+#endif
 
     // thresholding also produces the shared per-frame run tables, consumed
     // by the union-find pass and the gradient clustering

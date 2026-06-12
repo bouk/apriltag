@@ -53,6 +53,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #include "apriltag_math.h"
 
+#ifdef APRILTAG_METAL_ENABLED
+#include "apriltag_metal.h"
+#endif
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
@@ -406,6 +410,14 @@ apriltag_detector_t *apriltag_detector_create()
     // NB: defer initialization of td->wp so that the user can
     // override td->nthreads.
 
+#ifdef APRILTAG_METAL_ENABLED
+    if (getenv("APRILTAG_METAL")) {
+        td->metal = apriltag_metal_create();
+        if (!td->metal)
+            fprintf(stderr, "apriltag: Metal unavailable, using CPU pipeline\n");
+    }
+#endif
+
     return td;
 }
 
@@ -424,6 +436,10 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     free(td->cached_tile_bufs);
     free(td->cached_runs_buf);
     free(td->cached_row_off);
+#ifdef APRILTAG_METAL_ENABLED
+    if (td->metal)
+        apriltag_metal_destroy(td->metal);
+#endif
     free(td);
 }
 

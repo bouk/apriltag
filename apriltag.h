@@ -203,6 +203,11 @@ struct apriltag_detector
     int cached_runs_buf_size;
     uint32_t *cached_row_off;
     int cached_row_off_size;
+
+    // Metal GPU front-end context (NULL = CPU pipeline). Created in
+    // apriltag_detector_create when APRILTAG_METAL=1 is set in the
+    // environment and a Metal device is available.
+    void *metal;
 };
 
 // Represents the detection of a tag. These are returned to the user

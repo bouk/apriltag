@@ -82,6 +82,26 @@ file(GLOB TAG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/tag*.c)
 add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
 set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+# Metal GPU front-end (Apple Silicon)
+if (APPLE)
+    option(APRILTAG_METAL "Build the Metal GPU detector front-end" ON)
+endif()
+if (APPLE AND APRILTAG_METAL)
+    enable_language(OBJC)
+    set(METAL_EMBED ${CMAKE_CURRENT_BINARY_DIR}/apriltag_kernels_metal.c)
+    add_custom_command(OUTPUT ${METAL_EMBED}
+        COMMAND xxd -i -n apriltag_kernels_metal
+                ${CMAKE_CURRENT_SOURCE_DIR}/metal/apriltag_kernels.metal
+                > ${METAL_EMBED}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/metal/apriltag_kernels.metal
+        COMMENT "Embedding Metal kernel source")
+    target_sources(${PROJECT_NAME} PRIVATE apriltag_metal.m ${METAL_EMBED})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE APRILTAG_METAL_ENABLED=1)
+    set_source_files_properties(apriltag_metal.m PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc;-Wno-gnu-statement-expression-from-macro-expansion")
+    target_link_libraries(${PROJECT_NAME} PUBLIC
+        "-framework Metal" "-framework Foundation")
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT APPLE AND NOT CMAKE_C_SIMULATE_ID MATCHES "MSVC")
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,relro,-z,now,-z,defs")
 endif()
