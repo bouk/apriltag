@@ -6,3 +6,6 @@ cdb964d	3.126	2.891	8.758	12.463	1.740	0.039	29.017	6282	NEON campaign [baseline
 e03f59a	1.491	2.892	8.652	11.637	1.744	0.037	26.452	5710	NEON campaign [neon-bbox-keys]: NEON: fit_quads bbox min/max + angle sort keys + border dot
 171e186	1.583	2.836	8.492	10.801	1.704	0.040	25.455	5476	NEON campaign [neon-segment-maxima]: NEON: lfps weights, window errors, 7-tap filter, maxima scan
 512d017	1.452	2.826	8.420	10.678	1.589	0.038	25.004	5798	NEON campaign [neon-refine-edges]: NEON: refine_edges 2-wide masked bilinear sampling
+e1c1b05	1.692	3.044	9.523	12.070	1.827	0.039	28.193	5946	NEON+Metal branch: CPU-only at 4 threads (NEON fit_quads/refine, GPU off)
+e1c1b05	0.001	0.000	1.768	5.261	0.974	0.041	8.045	3373	NEON+Metal: pipelined Metal front-end + NEON fit_quads/refine at 12 threads
+e1c1b05	0.001	0.000	1.354	10.392	1.658	0.039	13.444	4256	NEON+Metal: pipelined Metal front-end + NEON fit_quads/refine at 4 threads
