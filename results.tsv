@@ -9,3 +9,5 @@ e03f59a	1.491	2.892	8.652	11.637	1.744	0.037	26.452	5710	NEON campaign [neon-bbo
 e1c1b05	1.692	3.044	9.523	12.070	1.827	0.039	28.193	5946	NEON+Metal branch: CPU-only at 4 threads (NEON fit_quads/refine, GPU off)
 e1c1b05	0.001	0.000	1.768	5.261	0.974	0.041	8.045	3373	NEON+Metal: pipelined Metal front-end + NEON fit_quads/refine at 12 threads
 e1c1b05	0.001	0.000	1.354	10.392	1.658	0.039	13.444	4256	NEON+Metal: pipelined Metal front-end + NEON fit_quads/refine at 4 threads
+caff614	0.001	0.000	2.786	6.791	1.664	0.038	11.280	3864	GPU quad-prep: angle keys + slope sort on Metal, 4 threads
+caff614-dirty	0.001	0.000	3.107	4.121	0.988	0.044	8.260	3602	GPU quad-prep: angle keys + slope sort on Metal, 12 threads
