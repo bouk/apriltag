@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <pthread.h>
 #include <stdatomic.h>
 
 #include "apriltag_metal.h"
@@ -65,8 +66,13 @@ struct apriltag_metal {
     id<MTLComputePipelineState> radix_hist, radix_scan, radix_scatter;
     id<MTLComputePipelineState> cluster_bounds, arena_headers, arena_scatter;
 
-    // persistent buffers (grow-only)
-    id<MTLBuffer> img;        // stride*h bytes, copy-in
+    // persistent buffers (grow-only). The five buffers the CPU touches
+    // while another frame's GPU work may be in flight (image staging in,
+    // params/state, cluster arena out) exist once per pipeline slot so a
+    // prepared frame N+1 cannot clobber what frame N's CPU half reads;
+    // everything else is GPU-internal and serialized by Metal's hazard
+    // tracking across command buffers.
+    id<MTLBuffer> img[2];     // stride*h bytes, copy-in
     id<MTLBuffer> threshim;   // stride*h
     id<MTLBuffer> tiles;      // 4 * tw*th (min, max, blurred min, blurred max)
     id<MTLBuffer> row_off;    // (h+1) u32
@@ -82,22 +88,29 @@ struct apriltag_metal {
     id<MTLBuffer> hist;       // RADIX_BINS * (records_cap/RADIX_BLOCK+1) u32
     id<MTLBuffer> c_of;       // records_cap u32
     id<MTLBuffer> starts;     // (clusters_cap+1) u32
-    id<MTLBuffer> arena_off;  // clusters_cap u32
-    id<MTLBuffer> arena;      // 8*clusters_cap + 8*records_cap bytes
-    id<MTLBuffer> params_buf; // ATParams
-    id<MTLBuffer> state_buf;  // ATState
+    id<MTLBuffer> arena_off[2]; // clusters_cap u32
+    id<MTLBuffer> arena[2];   // 8*clusters_cap + 8*records_cap bytes
+    id<MTLBuffer> params_buf[2]; // ATParams
+    id<MTLBuffer> state_buf[2];  // ATState
     id<MTLBuffer> shifts;     // N_RADIX_PASSES u32 (radix pass shifts)
 
     ATParams p;
-    uint32_t cur_w, cur_h, cur_s;
     int validate;
     int prof;
 
-    // front-end committed by apriltag_metal_frontend_begin and not yet
-    // consumed by apriltag_metal_clusters. pending_im is only compared by
-    // pointer; the pixels were already copied into m->img at begin time.
-    id<MTLCommandBuffer> pending_cb;
-    const image_u8_t *pending_im;
+    // front-ends committed by apriltag_metal_frontend_begin and not yet
+    // consumed by apriltag_metal_clusters (FIFO, at most one per slot).
+    // pend_im is only compared by pointer; the pixels were already copied
+    // into the slot's img buffer at begin time. mu protects this queue,
+    // the slot allocator, and all encode/buffer setup, so frontend_begin
+    // may be called from a different thread than detect.
+    id<MTLCommandBuffer> pend_cb[2];
+    const image_u8_t *pend_im[2];
+    uint32_t pend_w[2], pend_h[2], pend_s[2];
+    int pend_slot[2];
+    int npend;
+    int next_slot;
+    pthread_mutex_t mu;
 };
 
 static id<MTLComputePipelineState> make_pso(id<MTLDevice> dev, id<MTLLibrary> lib,
@@ -172,6 +185,7 @@ apriltag_metal_t *apriltag_metal_create(void)
         PSO(arena_scatter, "k_arena_scatter");
 #undef PSO
 
+        pthread_mutex_init(&m->mu, NULL);
         m->validate = getenv("APRILTAG_METAL_VALIDATE") != NULL;
         m->prof = getenv("APRILTAG_METAL_PROF") != NULL;
         return m;
@@ -182,10 +196,11 @@ void apriltag_metal_destroy(apriltag_metal_t *m)
 {
     if (!m)
         return;
-    if (m->pending_cb) {
-        [m->pending_cb waitUntilCompleted];
-        m->pending_cb = nil;
+    for (int i = 0; i < m->npend; i++) {
+        [m->pend_cb[i] waitUntilCompleted];
+        m->pend_cb[i] = nil;
     }
+    m->npend = 0;
     // ARC releases the ObjC objects when the struct fields are nilled;
     // under MRC-with-ARC-file this file is compiled with ARC, so just
     // free the C allocation after clearing references.
@@ -199,12 +214,17 @@ void apriltag_metal_destroy(apriltag_metal_t *m)
     m->emit_count = m->scan_blocks = m->emit_scatter = nil;
     m->radix_hist = m->radix_scan = m->radix_scatter = nil;
     m->cluster_bounds = m->arena_headers = m->arena_scatter = nil;
-    m->img = m->threshim = m->tiles = m->row_off = m->runs = nil;
+    m->img[0] = m->img[1] = nil;
+    m->threshim = m->tiles = m->row_off = m->runs = nil;
     m->parent = m->count = m->dense = m->node_lbl = m->labels = nil;
     m->block_counts = nil;
     m->keys[0] = m->keys[1] = m->pts[0] = m->pts[1] = nil;
-    m->hist = m->c_of = m->starts = m->arena_off = m->arena = nil;
-    m->params_buf = m->state_buf = m->shifts = nil;
+    m->hist = m->c_of = m->starts = nil;
+    m->arena_off[0] = m->arena_off[1] = m->arena[0] = m->arena[1] = nil;
+    m->params_buf[0] = m->params_buf[1] = nil;
+    m->state_buf[0] = m->state_buf[1] = nil;
+    m->shifts = nil;
+    pthread_mutex_destroy(&m->mu);
     free(m);
 }
 
@@ -216,7 +236,7 @@ static id<MTLBuffer> ensure_buf(apriltag_metal_t *m, id<MTLBuffer> cur, size_t l
 }
 
 static void setup_buffers(apriltag_metal_t *m, apriltag_detector_t *td,
-                          image_u8_t *im)
+                          image_u8_t *im, int slot)
 {
     uint32_t w = im->width, h = im->height, s = im->stride;
     ATParams *p = &m->p;
@@ -237,7 +257,7 @@ static void setup_buffers(apriltag_metal_t *m, apriltag_detector_t *td,
     }
     p->emit_blocks_x = (w + 255)/256;
 
-    m->img = ensure_buf(m, m->img, (size_t)s*h);
+    m->img[slot] = ensure_buf(m, m->img[slot], (size_t)s*h);
     m->threshim = ensure_buf(m, m->threshim, (size_t)s*h);
     m->tiles = ensure_buf(m, m->tiles, (size_t)4*p->tw*p->th);
     m->row_off = ensure_buf(m, m->row_off, (size_t)(h + 1)*4);
@@ -257,21 +277,17 @@ static void setup_buffers(apriltag_metal_t *m, apriltag_detector_t *td,
                          (size_t)RADIX_BINS*(p->records_cap/RADIX_BLOCK + 1)*4);
     m->c_of = ensure_buf(m, m->c_of, (size_t)p->records_cap*4);
     m->starts = ensure_buf(m, m->starts, (size_t)(p->clusters_cap + 1)*4);
-    m->arena_off = ensure_buf(m, m->arena_off, (size_t)p->clusters_cap*4);
-    m->arena = ensure_buf(m, m->arena,
-                          (size_t)8*p->clusters_cap + (size_t)8*p->records_cap);
-    m->params_buf = ensure_buf(m, m->params_buf, sizeof(ATParams));
-    m->state_buf = ensure_buf(m, m->state_buf, sizeof(ATState));
+    m->arena_off[slot] = ensure_buf(m, m->arena_off[slot], (size_t)p->clusters_cap*4);
+    m->arena[slot] = ensure_buf(m, m->arena[slot],
+                                (size_t)8*p->clusters_cap + (size_t)8*p->records_cap);
+    m->params_buf[slot] = ensure_buf(m, m->params_buf[slot], sizeof(ATParams));
+    m->state_buf[slot] = ensure_buf(m, m->state_buf[slot], sizeof(ATState));
     m->shifts = ensure_buf(m, m->shifts, N_RADIX_PASSES*4);
 
-    memcpy(m->params_buf.contents, p, sizeof(*p));
+    memcpy(m->params_buf[slot].contents, p, sizeof(*p));
     uint32_t *sh = m->shifts.contents;
     for (uint32_t i = 0; i < N_RADIX_PASSES; i++)
         sh[i] = 8*i;
-
-    m->cur_w = w;
-    m->cur_h = h;
-    m->cur_s = s;
 }
 
 // dispatch helpers
@@ -301,7 +317,7 @@ static void disp_indirect(id<MTLComputeCommandEncoder> enc,
 }
 
 static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
-                           image_u8_t *im, zarray_t *gpu_clusters);
+                           image_u8_t *im, zarray_t *gpu_clusters, int slot);
 
 // Encode the whole front-end chain (threshold/RLE, union-find/labels,
 // emission/sort/arena) into one serial command buffer and commit it
@@ -310,14 +326,19 @@ static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
 // the indirect dispatch arguments written by the scan kernels.
 static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
                                             apriltag_detector_t *td,
-                                            image_u8_t *im)
+                                            image_u8_t *im, int slot)
 {
-        setup_buffers(m, td, im);
+        setup_buffers(m, td, im, slot);
+        id<MTLBuffer> img = m->img[slot];
+        id<MTLBuffer> arena_off = m->arena_off[slot];
+        id<MTLBuffer> arena = m->arena[slot];
+        id<MTLBuffer> params_buf = m->params_buf[slot];
+        id<MTLBuffer> state_buf = m->state_buf[slot];
         ATParams *p = &m->p;
         uint32_t w = p->w, h = p->h;
 
-        memcpy(m->img.contents, im->buf, (size_t)p->s*h);
-        ATState *st = m->state_buf.contents;
+        memcpy(img.contents, im->buf, (size_t)p->s*h);
+        ATState *st = state_buf.contents;
         memset(st, 0, sizeof(*st));
 
         const size_t off_runs_tg = offsetof(ATState, runs_tg);
@@ -331,34 +352,34 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
 
         // ---- threshold + RLE -------------------------------------
         {
-            [enc setBuffer:m->img offset:0 atIndex:0];
+            [enc setBuffer:img offset:0 atIndex:0];
             [enc setBuffer:m->tiles offset:0 atIndex:1];
             [enc setBuffer:m->tiles offset:(size_t)p->tw*p->th atIndex:2];
-            [enc setBuffer:m->params_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:3];
             disp2d(enc, m->minmax, p->tw, p->th, 16, 16);
 
             [enc setBuffer:m->tiles offset:0 atIndex:0];
             [enc setBuffer:m->tiles offset:(size_t)p->tw*p->th atIndex:1];
             [enc setBuffer:m->tiles offset:(size_t)2*p->tw*p->th atIndex:2];
             [enc setBuffer:m->tiles offset:(size_t)3*p->tw*p->th atIndex:3];
-            [enc setBuffer:m->params_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:4];
             disp2d(enc, m->blur, p->tw, p->th, 16, 16);
 
-            [enc setBuffer:m->img offset:0 atIndex:0];
+            [enc setBuffer:img offset:0 atIndex:0];
             [enc setBuffer:m->tiles offset:(size_t)2*p->tw*p->th atIndex:1];
             [enc setBuffer:m->tiles offset:(size_t)3*p->tw*p->th atIndex:2];
             [enc setBuffer:m->threshim offset:0 atIndex:3];
-            [enc setBuffer:m->params_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:4];
             disp2d(enc, m->threshold, w, h, 32, 8);
 
             [enc setBuffer:m->threshim offset:0 atIndex:0];
             [enc setBuffer:m->row_off offset:0 atIndex:1];
-            [enc setBuffer:m->params_buf offset:0 atIndex:2];
+            [enc setBuffer:params_buf offset:0 atIndex:2];
             disp1d(enc, m->rle_count, h, 64);
 
             [enc setBuffer:m->row_off offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            [enc setBuffer:m->params_buf offset:0 atIndex:2];
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            [enc setBuffer:params_buf offset:0 atIndex:2];
             [enc setComputePipelineState:m->scan_rows];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -366,48 +387,48 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
             [enc setBuffer:m->threshim offset:0 atIndex:0];
             [enc setBuffer:m->row_off offset:0 atIndex:1];
             [enc setBuffer:m->runs offset:0 atIndex:2];
-            [enc setBuffer:m->params_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:3];
             disp1d(enc, m->rle_fill, h, 64);
         }
 
         // ---- union-find + labels ----------------------------------
         {
             [enc setBuffer:m->parent offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            disp_indirect(enc, m->uf_init, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            disp_indirect(enc, m->uf_init, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->parent offset:0 atIndex:0];
             [enc setBuffer:m->runs offset:0 atIndex:1];
             [enc setBuffer:m->row_off offset:0 atIndex:2];
             [enc setBuffer:m->threshim offset:0 atIndex:3];
-            [enc setBuffer:m->state_buf offset:0 atIndex:4];
-            [enc setBuffer:m->params_buf offset:0 atIndex:5];
-            disp_indirect(enc, m->uf_connect, m->state_buf, off_runs_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
+            disp_indirect(enc, m->uf_connect, state_buf, off_runs_tg, 256);
 
             [enc setBuffer:m->parent offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            disp_indirect(enc, m->uf_flatten, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            disp_indirect(enc, m->uf_flatten, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->count offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            disp_indirect(enc, m->zero_u32, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            disp_indirect(enc, m->zero_u32, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->parent offset:0 atIndex:0];
             [enc setBuffer:m->count offset:0 atIndex:1];
             [enc setBuffer:m->runs offset:0 atIndex:2];
-            [enc setBuffer:m->state_buf offset:0 atIndex:3];
-            disp_indirect(enc, m->comp_count, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:3];
+            disp_indirect(enc, m->comp_count, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->parent offset:0 atIndex:0];
             [enc setBuffer:m->count offset:0 atIndex:1];
             [enc setBuffer:m->dense offset:0 atIndex:2];
-            [enc setBuffer:m->state_buf offset:0 atIndex:3];
-            [enc setBuffer:m->params_buf offset:0 atIndex:4];
-            disp_indirect(enc, m->root_flag, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:4];
+            disp_indirect(enc, m->root_flag, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->dense offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            [enc setBuffer:m->params_buf offset:0 atIndex:2];
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            [enc setBuffer:params_buf offset:0 atIndex:2];
             [enc setComputePipelineState:m->scan_nodes];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -416,20 +437,20 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
             [enc setBuffer:m->count offset:0 atIndex:1];
             [enc setBuffer:m->dense offset:0 atIndex:2];
             [enc setBuffer:m->node_lbl offset:0 atIndex:3];
-            [enc setBuffer:m->state_buf offset:0 atIndex:4];
-            [enc setBuffer:m->params_buf offset:0 atIndex:5];
-            disp_indirect(enc, m->node_label, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
+            disp_indirect(enc, m->node_label, state_buf, off_nodes_tg, 256);
 
             [enc setBuffer:m->labels offset:0 atIndex:0];
-            [enc setBuffer:m->params_buf offset:0 atIndex:1];
+            [enc setBuffer:params_buf offset:0 atIndex:1];
             disp1d(enc, m->label_clear, w*h, 256);
 
             [enc setBuffer:m->node_lbl offset:0 atIndex:0];
             [enc setBuffer:m->runs offset:0 atIndex:1];
             [enc setBuffer:m->labels offset:0 atIndex:2];
-            [enc setBuffer:m->state_buf offset:0 atIndex:3];
-            [enc setBuffer:m->params_buf offset:0 atIndex:4];
-            disp_indirect(enc, m->label_paint, m->state_buf, off_nodes_tg, 256);
+            [enc setBuffer:state_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:4];
+            disp_indirect(enc, m->label_paint, state_buf, off_nodes_tg, 256);
         }
 
         // ---- emission + sort + arena -------------------------------
@@ -437,14 +458,14 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
             [enc setBuffer:m->threshim offset:0 atIndex:0];
             [enc setBuffer:m->labels offset:0 atIndex:1];
             [enc setBuffer:m->block_counts offset:0 atIndex:2];
-            [enc setBuffer:m->params_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:3];
             [enc setComputePipelineState:m->emit_count];
             [enc dispatchThreadgroups:MTLSizeMake(p->emit_blocks_x, h, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
             [enc setBuffer:m->block_counts offset:0 atIndex:0];
-            [enc setBuffer:m->state_buf offset:0 atIndex:1];
-            [enc setBuffer:m->params_buf offset:0 atIndex:2];
+            [enc setBuffer:state_buf offset:0 atIndex:1];
+            [enc setBuffer:params_buf offset:0 atIndex:2];
             [enc setComputePipelineState:m->scan_blocks];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -454,7 +475,7 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
             [enc setBuffer:m->block_counts offset:0 atIndex:2];
             [enc setBuffer:m->keys[0] offset:0 atIndex:3];
             [enc setBuffer:m->pts[0] offset:0 atIndex:4];
-            [enc setBuffer:m->params_buf offset:0 atIndex:5];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
             [enc setComputePipelineState:m->emit_scatter];
             [enc dispatchThreadgroups:MTLSizeMake(p->emit_blocks_x, h, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -465,12 +486,12 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
 
                 [enc setBuffer:m->keys[src] offset:0 atIndex:0];
                 [enc setBuffer:m->hist offset:0 atIndex:1];
-                [enc setBuffer:m->state_buf offset:0 atIndex:2];
+                [enc setBuffer:state_buf offset:0 atIndex:2];
                 [enc setBuffer:m->shifts offset:(size_t)pass*4 atIndex:3];
-                disp_indirect(enc, m->radix_hist, m->state_buf, off_radix_tg, 256);
+                disp_indirect(enc, m->radix_hist, state_buf, off_radix_tg, 256);
 
                 [enc setBuffer:m->hist offset:0 atIndex:0];
-                [enc setBuffer:m->state_buf offset:0 atIndex:1];
+                [enc setBuffer:state_buf offset:0 atIndex:1];
                 [enc setComputePipelineState:m->radix_scan];
                 [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -480,37 +501,37 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
                 [enc setBuffer:m->keys[dst] offset:0 atIndex:2];
                 [enc setBuffer:m->pts[dst] offset:0 atIndex:3];
                 [enc setBuffer:m->hist offset:0 atIndex:4];
-                [enc setBuffer:m->state_buf offset:0 atIndex:5];
+                [enc setBuffer:state_buf offset:0 atIndex:5];
                 [enc setBuffer:m->shifts offset:(size_t)pass*4 atIndex:6];
-                disp_indirect(enc, m->radix_scatter, m->state_buf, off_radix_tg, 256);
+                disp_indirect(enc, m->radix_scatter, state_buf, off_radix_tg, 256);
             }
 
             // after an even number of passes the data is in set 0
             [enc setBuffer:m->keys[0] offset:0 atIndex:0];
             [enc setBuffer:m->c_of offset:0 atIndex:1];
             [enc setBuffer:m->starts offset:0 atIndex:2];
-            [enc setBuffer:m->arena_off offset:0 atIndex:3];
-            [enc setBuffer:m->state_buf offset:0 atIndex:4];
-            [enc setBuffer:m->params_buf offset:0 atIndex:5];
+            [enc setBuffer:arena_off offset:0 atIndex:3];
+            [enc setBuffer:state_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
             [enc setComputePipelineState:m->cluster_bounds];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
             [enc setBuffer:m->starts offset:0 atIndex:0];
-            [enc setBuffer:m->arena_off offset:0 atIndex:1];
-            [enc setBuffer:m->arena offset:0 atIndex:2];
-            [enc setBuffer:m->state_buf offset:0 atIndex:3];
-            [enc setBuffer:m->params_buf offset:0 atIndex:4];
-            disp_indirect(enc, m->arena_headers, m->state_buf, off_cl_tg, 256);
+            [enc setBuffer:arena_off offset:0 atIndex:1];
+            [enc setBuffer:arena offset:0 atIndex:2];
+            [enc setBuffer:state_buf offset:0 atIndex:3];
+            [enc setBuffer:params_buf offset:0 atIndex:4];
+            disp_indirect(enc, m->arena_headers, state_buf, off_cl_tg, 256);
 
             [enc setBuffer:m->pts[0] offset:0 atIndex:0];
             [enc setBuffer:m->c_of offset:0 atIndex:1];
             [enc setBuffer:m->starts offset:0 atIndex:2];
-            [enc setBuffer:m->arena_off offset:0 atIndex:3];
-            [enc setBuffer:m->arena offset:0 atIndex:4];
-            [enc setBuffer:m->state_buf offset:0 atIndex:5];
-            [enc setBuffer:m->params_buf offset:0 atIndex:6];
-            disp_indirect(enc, m->arena_scatter, m->state_buf, off_rec_tg, 256);
+            [enc setBuffer:arena_off offset:0 atIndex:3];
+            [enc setBuffer:arena offset:0 atIndex:4];
+            [enc setBuffer:state_buf offset:0 atIndex:5];
+            [enc setBuffer:params_buf offset:0 atIndex:6];
+            disp_indirect(enc, m->arena_scatter, state_buf, off_rec_tg, 256);
         }
 
         [enc endEncoding];
@@ -519,25 +540,63 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
 }
 
 // Kick off the GPU front-end for an image about to be detected; the GPU
-// runs while the caller does unrelated CPU work (e.g. loading the next
-// frame). The pixels are copied out synchronously, but `im` must still be
-// the live pointer later passed to apriltag_detector_detect.
+// runs while the caller does unrelated CPU work (the next frame's load,
+// or — because the CPU-visible buffers are per-slot — the previous
+// frame's quad fitting and decode, so this may be called from a loader
+// thread while apriltag_detector_detect runs. The pixels are copied out
+// synchronously, but `im` must still be the live pointer later passed to
+// apriltag_detector_detect.
 void apriltag_metal_frontend_begin(apriltag_metal_t *m, apriltag_detector_t *td,
                                    image_u8_t *im)
 {
     @autoreleasepool {
-        if (m->pending_cb) {
-            // an unconsumed prepared frame still owns the shared buffers;
-            // let it drain before re-encoding over them
-            [m->pending_cb waitUntilCompleted];
-            m->pending_cb = nil;
+        pthread_mutex_lock(&m->mu);
+        if (m->npend == 2) {
+            // queue full (callers normally keep at most one outstanding);
+            // drop the oldest prepared frame
+            [m->pend_cb[0] waitUntilCompleted];
+            m->pend_cb[0] = m->pend_cb[1];
+            m->pend_im[0] = m->pend_im[1];
+            m->pend_w[0] = m->pend_w[1];
+            m->pend_h[0] = m->pend_h[1];
+            m->pend_s[0] = m->pend_s[1];
+            m->pend_slot[0] = m->pend_slot[1];
+            m->pend_cb[1] = nil;
+            m->npend = 1;
+        }
+        int slot = m->next_slot;
+        m->next_slot ^= 1;
+        // never encode into a slot a queued frame still owns
+        for (int i = 0; i < m->npend; i++) {
+            if (m->pend_slot[i] == slot) {
+                [m->pend_cb[i] waitUntilCompleted];
+                m->pend_cb[i] = nil;
+                for (int j = i + 1; j < m->npend; j++) {
+                    m->pend_cb[j-1] = m->pend_cb[j];
+                    m->pend_im[j-1] = m->pend_im[j];
+                    m->pend_w[j-1] = m->pend_w[j];
+                    m->pend_h[j-1] = m->pend_h[j];
+                    m->pend_s[j-1] = m->pend_s[j];
+                    m->pend_slot[j-1] = m->pend_slot[j];
+                }
+                m->pend_cb[m->npend-1] = nil;
+                m->npend--;
+                break;
+            }
         }
         CFAbsoluteTime t0 = m->prof ? CFAbsoluteTimeGetCurrent() : 0;
-        m->pending_cb = frontend_commit(m, td, im);
-        m->pending_im = im;
+        id<MTLCommandBuffer> cb = frontend_commit(m, td, im, slot);
+        int i = m->npend++;
+        m->pend_cb[i] = cb;
+        m->pend_im[i] = im;
+        m->pend_w[i] = im->width;
+        m->pend_h[i] = im->height;
+        m->pend_s[i] = im->stride;
+        m->pend_slot[i] = slot;
         if (m->prof)
             fprintf(stderr, "[prof] prepare      encode+commit %6.3f ms\n",
                     (CFAbsoluteTimeGetCurrent() - t0)*1e3);
+        pthread_mutex_unlock(&m->mu);
     }
 }
 
@@ -545,20 +604,50 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
                                   image_u8_t *im)
 {
     @autoreleasepool {
-        id<MTLCommandBuffer> cb;
-        if (m->pending_cb && m->pending_im == im &&
-            m->cur_w == (uint32_t)im->width &&
-            m->cur_h == (uint32_t)im->height &&
-            m->cur_s == (uint32_t)im->stride) {
-            cb = m->pending_cb; // prepared by apriltag_detector_detect_prepare
-        } else {
-            if (m->pending_cb) // stale prepare for a different image
-                [m->pending_cb waitUntilCompleted];
-            m->pending_cb = nil;
-            cb = frontend_commit(m, td, im);
+        pthread_mutex_lock(&m->mu);
+        id<MTLCommandBuffer> cb = nil;
+        int slot = -1;
+        int found = -1;
+        for (int i = 0; i < m->npend; i++) {
+            if (m->pend_im[i] == im && m->pend_w[i] == (uint32_t)im->width &&
+                m->pend_h[i] == (uint32_t)im->height &&
+                m->pend_s[i] == (uint32_t)im->stride) {
+                found = i;
+                break;
+            }
         }
-        m->pending_cb = nil;
-        m->pending_im = NULL;
+        if (found >= 0) {
+            // drop prepared frames older than the one being detected
+            for (int i = 0; i < found; i++) {
+                [m->pend_cb[i] waitUntilCompleted];
+                m->pend_cb[i] = nil;
+            }
+            cb = m->pend_cb[found];
+            slot = m->pend_slot[found];
+            int k = 0;
+            for (int i = found + 1; i < m->npend; i++, k++) {
+                m->pend_cb[k] = m->pend_cb[i];
+                m->pend_im[k] = m->pend_im[i];
+                m->pend_w[k] = m->pend_w[i];
+                m->pend_h[k] = m->pend_h[i];
+                m->pend_s[k] = m->pend_s[i];
+                m->pend_slot[k] = m->pend_slot[i];
+            }
+            for (int i = k; i < m->npend; i++)
+                m->pend_cb[i] = nil;
+            m->npend = k;
+        } else {
+            // nothing (or only stale frames) prepared: drain and encode now
+            for (int i = 0; i < m->npend; i++) {
+                [m->pend_cb[i] waitUntilCompleted];
+                m->pend_cb[i] = nil;
+            }
+            m->npend = 0;
+            slot = m->next_slot;
+            m->next_slot ^= 1;
+            cb = frontend_commit(m, td, im, slot);
+        }
+        pthread_mutex_unlock(&m->mu);
         timeprofile_stamp(td->tp, "threshold");
         timeprofile_stamp(td->tp, "unionfind");
 
@@ -575,7 +664,7 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
                     (cb.kernelEndTime - cb.kernelStartTime)*1e3);
         }
 
-        ATState *st = m->state_buf.contents;
+        ATState *st = m->state_buf[slot].contents;
         if (st->overflow) {
             fprintf(stderr, "apriltag_metal: overflow flags 0x%x; "
                             "increase caps\n", st->overflow);
@@ -584,8 +673,8 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
 
         // build the zarray of pt_list* pointing into the arena
         uint32_t ncl = st->nclusters;
-        uint32_t *arena_off = m->arena_off.contents;
-        uint8_t *arena = m->arena.contents;
+        uint32_t *arena_off = m->arena_off[slot].contents;
+        uint8_t *arena = m->arena[slot].contents;
         zarray_t *clusters = zarray_create(sizeof(struct pt_list *));
         zarray_ensure_capacity(clusters, ncl);
         for (uint32_t c = 0; c < ncl; c++) {
@@ -594,8 +683,13 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
         }
         timeprofile_stamp(td->tp, "make clusters");
 
-        if (m->validate)
-            validate_frame(m, td, im, clusters);
+        if (m->validate) {
+            // hold the queue lock so a concurrent frontend_begin cannot
+            // overwrite the shared GPU scratch being compared
+            pthread_mutex_lock(&m->mu);
+            validate_frame(m, td, im, clusters, slot);
+            pthread_mutex_unlock(&m->mu);
+        }
 
         return clusters;
     }
@@ -621,7 +715,7 @@ static int cmp_u64(const void *a, const void *b)
 }
 
 static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
-                           image_u8_t *im, zarray_t *gpu_clusters)
+                           image_u8_t *im, zarray_t *gpu_clusters, int slot)
 {
     int w = im->width, h = im->height;
 
@@ -640,7 +734,7 @@ static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
     fprintf(stderr, "[validate] threshim: %ld byte diffs\n", tdiff);
 
     // 2. runs
-    ATState *st = m->state_buf.contents;
+    ATState *st = m->state_buf[slot].contents;
     uint32_t *gpu_row_off = m->row_off.contents;
     long rdiff = (long)cpu_row_off[h] - (long)st->nruns;
     long rbad = 0;
@@ -822,7 +916,7 @@ static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
         }
         // index GPU clusters by key: keys live in m->keys[0] sorted; cluster
         // c covers records [starts[c], starts[c+1])
-        ATState *stt = m->state_buf.contents;
+        ATState *stt = m->state_buf[slot].contents;
         uint32_t *gkeys = m->keys[0].contents;
         uint32_t *gstarts = m->starts.contents;
         uint32_t ngcl = stt->nclusters;
@@ -866,14 +960,14 @@ static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
                 continue;
             uint32_t gsz = gstarts[found+1] - gstarts[found];
             if ((int)gsz == cl->size) {
-                struct pt *gpts = (struct pt *)((uint8_t *)m->arena.contents +
-                                  ((uint32_t *)m->arena_off.contents)[found] + 8);
+                struct pt *gpts = (struct pt *)((uint8_t *)m->arena[slot].contents +
+                                  ((uint32_t *)m->arena_off[slot].contents)[found] + 8);
                 if (memcmp(gpts, cl->pts, sizeof(struct pt)*cl->size) == 0)
                     continue; // identical
             }
             // mismatch: print both sequences around first difference
-            struct pt *gpts = (struct pt *)((uint8_t *)m->arena.contents +
-                              ((uint32_t *)m->arena_off.contents)[found] + 8);
+            struct pt *gpts = (struct pt *)((uint8_t *)m->arena[slot].contents +
+                              ((uint32_t *)m->arena_off[slot].contents)[found] + 8);
             fprintf(stderr, "[deep] cluster key %u: cpu %d pts, gpu %u pts\n",
                     key, cl->size, gsz);
             int n = MIN(cl->size, (int)gsz);
