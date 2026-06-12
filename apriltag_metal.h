@@ -29,6 +29,13 @@ void apriltag_metal_destroy(apriltag_metal_t *m);
 zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
                                   image_u8_t *im);
 
+// asynchronously start the front-end for an image that will be passed to
+// apriltag_detector_detect next; apriltag_metal_clusters then only waits
+// for the in-flight work instead of running it on the critical path.
+// Called via apriltag_detector_detect_prepare.
+void apriltag_metal_frontend_begin(apriltag_metal_t *m, apriltag_detector_t *td,
+                                   image_u8_t *im);
+
 #ifdef __cplusplus
 }
 #endif

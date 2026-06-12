@@ -91,6 +91,13 @@ struct apriltag_metal {
     ATParams p;
     uint32_t cur_w, cur_h, cur_s;
     int validate;
+    int prof;
+
+    // front-end committed by apriltag_metal_frontend_begin and not yet
+    // consumed by apriltag_metal_clusters. pending_im is only compared by
+    // pointer; the pixels were already copied into m->img at begin time.
+    id<MTLCommandBuffer> pending_cb;
+    const image_u8_t *pending_im;
 };
 
 static id<MTLComputePipelineState> make_pso(id<MTLDevice> dev, id<MTLLibrary> lib,
@@ -166,6 +173,7 @@ apriltag_metal_t *apriltag_metal_create(void)
 #undef PSO
 
         m->validate = getenv("APRILTAG_METAL_VALIDATE") != NULL;
+        m->prof = getenv("APRILTAG_METAL_PROF") != NULL;
         return m;
     }
 }
@@ -174,6 +182,10 @@ void apriltag_metal_destroy(apriltag_metal_t *m)
 {
     if (!m)
         return;
+    if (m->pending_cb) {
+        [m->pending_cb waitUntilCompleted];
+        m->pending_cb = nil;
+    }
     // ARC releases the ObjC objects when the struct fields are nilled;
     // under MRC-with-ARC-file this file is compiled with ARC, so just
     // free the C allocation after clearing references.
@@ -288,27 +300,18 @@ static void disp_indirect(id<MTLComputeCommandEncoder> enc,
                           threadsPerThreadgroup:MTLSizeMake(tgx, 1, 1)];
 }
 
-static void run_cb(apriltag_metal_t *m, void (^encode)(id<MTLComputeCommandEncoder>))
-{
-    id<MTLCommandBuffer> cb = [m->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    encode(enc);
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "apriltag_metal: command buffer error: %s\n",
-                cb.error.localizedDescription.UTF8String);
-    }
-}
-
 static void validate_frame(apriltag_metal_t *m, apriltag_detector_t *td,
                            image_u8_t *im, zarray_t *gpu_clusters);
 
-zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
-                                  image_u8_t *im)
+// Encode the whole front-end chain (threshold/RLE, union-find/labels,
+// emission/sort/arena) into one serial command buffer and commit it
+// without waiting; the caller owns the wait. Sequential dispatches in a
+// serial compute encoder are ordered with memory coherence, including
+// the indirect dispatch arguments written by the scan kernels.
+static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
+                                            apriltag_detector_t *td,
+                                            image_u8_t *im)
 {
-    @autoreleasepool {
         setup_buffers(m, td, im);
         ATParams *p = &m->p;
         uint32_t w = p->w, h = p->h;
@@ -323,8 +326,11 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
         const size_t off_radix_tg = offsetof(ATState, radix_tg);
         const size_t off_cl_tg = offsetof(ATState, cl_tg);
 
-        // ---- CB1: threshold + RLE -------------------------------------
-        run_cb(m, ^(id<MTLComputeCommandEncoder> enc) {
+        id<MTLCommandBuffer> cb = [m->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        // ---- threshold + RLE -------------------------------------
+        {
             [enc setBuffer:m->img offset:0 atIndex:0];
             [enc setBuffer:m->tiles offset:0 atIndex:1];
             [enc setBuffer:m->tiles offset:(size_t)p->tw*p->th atIndex:2];
@@ -362,17 +368,10 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
             [enc setBuffer:m->runs offset:0 atIndex:2];
             [enc setBuffer:m->params_buf offset:0 atIndex:3];
             disp1d(enc, m->rle_fill, h, 64);
-        });
-        timeprofile_stamp(td->tp, "threshold");
-
-        if (st->overflow) {
-            fprintf(stderr, "apriltag_metal: buffer overflow (flags 0x%x); "
-                            "increase caps\n", st->overflow);
-            return zarray_create(sizeof(struct pt_list *));
         }
 
-        // ---- CB2: union-find + labels ----------------------------------
-        run_cb(m, ^(id<MTLComputeCommandEncoder> enc) {
+        // ---- union-find + labels ----------------------------------
+        {
             [enc setBuffer:m->parent offset:0 atIndex:0];
             [enc setBuffer:m->state_buf offset:0 atIndex:1];
             disp_indirect(enc, m->uf_init, m->state_buf, off_nodes_tg, 256);
@@ -431,16 +430,10 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
             [enc setBuffer:m->state_buf offset:0 atIndex:3];
             [enc setBuffer:m->params_buf offset:0 atIndex:4];
             disp_indirect(enc, m->label_paint, m->state_buf, off_nodes_tg, 256);
-        });
-        timeprofile_stamp(td->tp, "unionfind");
-
-        if (st->overflow) {
-            fprintf(stderr, "apriltag_metal: overflow flags 0x%x\n", st->overflow);
-            return zarray_create(sizeof(struct pt_list *));
         }
 
-        // ---- CB3: emission + sort + arena -------------------------------
-        run_cb(m, ^(id<MTLComputeCommandEncoder> enc) {
+        // ---- emission + sort + arena -------------------------------
+        {
             [enc setBuffer:m->threshim offset:0 atIndex:0];
             [enc setBuffer:m->labels offset:0 atIndex:1];
             [enc setBuffer:m->block_counts offset:0 atIndex:2];
@@ -518,10 +511,74 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
             [enc setBuffer:m->state_buf offset:0 atIndex:5];
             [enc setBuffer:m->params_buf offset:0 atIndex:6];
             disp_indirect(enc, m->arena_scatter, m->state_buf, off_rec_tg, 256);
-        });
+        }
 
+        [enc endEncoding];
+        [cb commit];
+        return cb;
+}
+
+// Kick off the GPU front-end for an image about to be detected; the GPU
+// runs while the caller does unrelated CPU work (e.g. loading the next
+// frame). The pixels are copied out synchronously, but `im` must still be
+// the live pointer later passed to apriltag_detector_detect.
+void apriltag_metal_frontend_begin(apriltag_metal_t *m, apriltag_detector_t *td,
+                                   image_u8_t *im)
+{
+    @autoreleasepool {
+        if (m->pending_cb) {
+            // an unconsumed prepared frame still owns the shared buffers;
+            // let it drain before re-encoding over them
+            [m->pending_cb waitUntilCompleted];
+            m->pending_cb = nil;
+        }
+        CFAbsoluteTime t0 = m->prof ? CFAbsoluteTimeGetCurrent() : 0;
+        m->pending_cb = frontend_commit(m, td, im);
+        m->pending_im = im;
+        if (m->prof)
+            fprintf(stderr, "[prof] prepare      encode+commit %6.3f ms\n",
+                    (CFAbsoluteTimeGetCurrent() - t0)*1e3);
+    }
+}
+
+zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
+                                  image_u8_t *im)
+{
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb;
+        if (m->pending_cb && m->pending_im == im &&
+            m->cur_w == (uint32_t)im->width &&
+            m->cur_h == (uint32_t)im->height &&
+            m->cur_s == (uint32_t)im->stride) {
+            cb = m->pending_cb; // prepared by apriltag_detector_detect_prepare
+        } else {
+            if (m->pending_cb) // stale prepare for a different image
+                [m->pending_cb waitUntilCompleted];
+            m->pending_cb = nil;
+            cb = frontend_commit(m, td, im);
+        }
+        m->pending_cb = nil;
+        m->pending_im = NULL;
+        timeprofile_stamp(td->tp, "threshold");
+        timeprofile_stamp(td->tp, "unionfind");
+
+        CFAbsoluteTime t0 = m->prof ? CFAbsoluteTimeGetCurrent() : 0;
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError)
+            fprintf(stderr, "apriltag_metal: command buffer error: %s\n",
+                    cb.error.localizedDescription.UTF8String);
+        if (m->prof) {
+            CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+            fprintf(stderr, "[prof] frontend     wall %6.3f ms  gpu %6.3f ms  "
+                    "(kernel %6.3f ms)\n", (t1 - t0)*1e3,
+                    (cb.GPUEndTime - cb.GPUStartTime)*1e3,
+                    (cb.kernelEndTime - cb.kernelStartTime)*1e3);
+        }
+
+        ATState *st = m->state_buf.contents;
         if (st->overflow) {
-            fprintf(stderr, "apriltag_metal: overflow flags 0x%x\n", st->overflow);
+            fprintf(stderr, "apriltag_metal: overflow flags 0x%x; "
+                            "increase caps\n", st->overflow);
             return zarray_create(sizeof(struct pt_list *));
         }
 
