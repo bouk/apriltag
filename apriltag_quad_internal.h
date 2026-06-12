@@ -39,6 +39,16 @@ struct pt_list
     struct pt pts[];
 };
 
+// Per-cluster head of fit_quad precomputed by the Metal front-end:
+// bounding box, gradient-dot orientation sign, and the angle sort keys
+// already in sorted order (pointing into GPU-owned memory, valid as long
+// as the clusters are).
+struct apriltag_metal_quadprep {
+    const uint64_t *keys;
+    uint16_t xmin, xmax, ymin, ymax;
+    float dot;
+};
+
 // stage entry points (defined in apriltag_quad_thresh.c)
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
                       struct row_run **runs_out, uint32_t **row_off_out);

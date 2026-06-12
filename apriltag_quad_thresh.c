@@ -1380,7 +1380,8 @@ int fit_quad(
         int tag_width,
         bool normal_border,
         bool reversed_border,
-        struct quad_fit_scratch *scratch) {
+        struct quad_fit_scratch *scratch,
+        const struct apriltag_metal_quadprep *prep) {
     int res = 0;
 
     /////////////////////////////////////////////////////////////
@@ -1392,11 +1393,20 @@ int fit_quad(
     // according to their angle WRT the center.
     struct pt *pts = cluster->pts;
     int szc = cluster->size;
-    uint16_t xmax = pts[0].x;
-    uint16_t xmin = pts[0].x;
-    uint16_t ymax = pts[0].y;
-    uint16_t ymin = pts[0].y;
+    uint16_t xmax, xmin, ymax, ymin;
     int pidx = 1;
+    if (prep) {
+        // bbox (and below: dot, sorted keys) precomputed on the GPU
+        xmin = prep->xmin;
+        xmax = prep->xmax;
+        ymin = prep->ymin;
+        ymax = prep->ymax;
+        pidx = szc;
+    } else {
+    xmax = pts[0].x;
+    xmin = pts[0].x;
+    ymax = pts[0].y;
+    ymin = pts[0].y;
 
 #ifdef __AVX2__
     // 4 points per vector; x sits in u16 lanes 0,4,8,12 and y in
@@ -1457,6 +1467,7 @@ int fit_quad(
             ymin = p->y;
         }
     }
+    } // !prep
 
     if ((xmax - xmin)*(ymax - ymin) < tag_width) {
         return 0;
@@ -1478,8 +1489,14 @@ int fit_quad(
     float quadrants[2][2] = {{-1*(2 << 15), 0}, {2*(2 << 15), 2 << 15}};
 
     uint64_t *keys = scratch->sort_keys;
+    const uint64_t *skeys = keys;
 
     pidx = 0;
+    if (prep) {
+        dot = prep->dot;
+        skeys = prep->keys;
+        pidx = sz;
+    } else {
 
 #ifdef __AVX2__
     // 8 points per iteration. Every step of the key computation is a
@@ -1673,6 +1690,7 @@ int fit_quad(
         // by a stored slope field
         keys[pidx] = ((uint64_t)slope_sort_key(quadrant + dy/dx) << 32) | (uint32_t)~(uint32_t)pidx;
     }
+    } // !prep
 
     // Ensure that the black border is inside the white border.
     quad->reversed_border = dot < 0;
@@ -1685,13 +1703,38 @@ int fit_quad(
 
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
-    if (1) {
+    if (!prep) {
         pt_key_sort(sz, scratch);
+    } else if (getenv("APRILTAG_QP_CHECK")) {
+        // diagnostic: recompute keys on the CPU and compare
+        for (int k = 0; k < sz; k++) {
+            struct pt *p = &pts[k];
+            float ddx = p->x - cx;
+            float ddy = p->y - cy;
+            float quadrant = quadrants[ddy > 0][ddx > 0];
+            if (ddy < 0) { ddy = -ddy; ddx = -ddx; }
+            if (ddx < 0) { float tmp = ddx; ddx = ddy; ddy = -tmp; }
+            keys[k] = ((uint64_t)slope_sort_key(quadrant + ddy/ddx) << 32) | (uint32_t)~(uint32_t)k;
+        }
+        pt_key_sort(sz, scratch);
+        int vdiff = 0, odiff = 0;
+        for (int k = 0; k < sz; k++) {
+            if (keys[k] != skeys[k]) {
+                uint64_t found = 0;
+                for (int j = 0; j < sz; j++) if (keys[j] == skeys[k]) { found = 1; break; }
+                if (found) odiff++; else vdiff++;
+            }
+        }
+        if (vdiff || odiff) {
+            pthread_mutex_lock(&td->mutex);
+            fprintf(stderr, "[qpcheck] sz %d: %d value diffs, %d order diffs\n", sz, vdiff, odiff);
+            pthread_mutex_unlock(&td->mutex);
+        }
     }
 
     const struct lfps_soa *lfps = &scratch->lfps;
     // errs/yfilt/maxima_errs are free until quad_segment_maxima runs
-    compute_lfps(sz, pts, keys, im, lfps, scratch->errs, scratch->yfilt, scratch->maxima_errs);
+    compute_lfps(sz, pts, skeys, im, lfps, scratch->errs, scratch->yfilt, scratch->maxima_errs);
 
     int indices[4];
     if (1) {
@@ -2178,7 +2221,13 @@ static void do_quad_task(void *p)
             struct quad quad;
             memset(&quad, 0, sizeof(struct quad));
 
-            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
+            struct apriltag_metal_quadprep prep;
+            const struct apriltag_metal_quadprep *prep_p = NULL;
+#ifdef APRILTAG_METAL_ENABLED
+            if (td->metal && apriltag_metal_quadprep(td->metal, cidx, &prep))
+                prep_p = &prep;
+#endif
+            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch, prep_p)) {
                 pthread_mutex_lock(&td->mutex);
                 zarray_add(quads, &quad);
                 pthread_mutex_unlock(&td->mutex);

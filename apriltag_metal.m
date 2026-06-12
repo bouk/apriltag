@@ -46,7 +46,15 @@ typedef struct {
     uint32_t rec_tg[3];
     uint32_t radix_tg[3];
     uint32_t cl_tg[3];
+    uint32_t quad_tg[3];
 } ATState;
+
+// must match the .metal quad_aux exactly
+typedef struct {
+    uint16_t xmin, xmax, ymin, ymax;
+    float dot;
+    uint32_t sorted;
+} ATQuadAux;
 
 #define RADIX_BLOCK 1024u
 #define RADIX_BINS 256u
@@ -65,6 +73,7 @@ struct apriltag_metal {
     id<MTLComputePipelineState> emit_count, scan_blocks, emit_scatter;
     id<MTLComputePipelineState> radix_hist, radix_scan, radix_scatter;
     id<MTLComputePipelineState> cluster_bounds, arena_headers, arena_scatter;
+    id<MTLComputePipelineState> quad_bbox, quad_keys, quad_sort;
 
     // persistent buffers (grow-only). The five buffers the CPU touches
     // while another frame's GPU work may be in flight (image staging in,
@@ -90,6 +99,9 @@ struct apriltag_metal {
     id<MTLBuffer> starts;     // (clusters_cap+1) u32
     id<MTLBuffer> arena_off[2]; // clusters_cap u32
     id<MTLBuffer> arena[2];   // 8*clusters_cap + 8*records_cap bytes
+    id<MTLBuffer> keys64[2];  // angle sort keys, same layout as arena
+    id<MTLBuffer> quad_aux[2]; // per-cluster bbox/dot/sorted (ATQuadAux)
+    id<MTLBuffer> cxy_table;  // exact fp32 of (i*0.5 + noise), cx then cy
     id<MTLBuffer> params_buf[2]; // ATParams
     id<MTLBuffer> state_buf[2];  // ATState
     id<MTLBuffer> shifts;     // N_RADIX_PASSES u32 (radix pass shifts)
@@ -110,6 +122,7 @@ struct apriltag_metal {
     int pend_slot[2];
     int npend;
     int next_slot;
+    int cur_slot; // slot of the last consumed frame (quadprep reads it)
     pthread_mutex_t mu;
 };
 
@@ -141,6 +154,9 @@ apriltag_metal_t *apriltag_metal_create(void)
                                                  length:apriltag_kernels_metal_len
                                                encoding:NSUTF8StringEncoding];
         MTLCompileOptions *opts = [MTLCompileOptions new];
+        // the quad-key kernel needs IEEE fp32 (correctly rounded
+        // divide, no contraction) to track the CPU computation
+        opts.mathMode = MTLMathModeSafe;
         NSError *err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
         if (!lib) {
@@ -183,6 +199,9 @@ apriltag_metal_t *apriltag_metal_create(void)
         PSO(cluster_bounds, "k_cluster_bounds");
         PSO(arena_headers, "k_arena_headers");
         PSO(arena_scatter, "k_arena_scatter");
+        PSO(quad_bbox, "k_quad_bbox");
+        PSO(quad_keys, "k_quad_keys");
+        PSO(quad_sort, "k_quad_sort");
 #undef PSO
 
         pthread_mutex_init(&m->mu, NULL);
@@ -214,6 +233,9 @@ void apriltag_metal_destroy(apriltag_metal_t *m)
     m->emit_count = m->scan_blocks = m->emit_scatter = nil;
     m->radix_hist = m->radix_scan = m->radix_scatter = nil;
     m->cluster_bounds = m->arena_headers = m->arena_scatter = nil;
+    m->quad_bbox = m->quad_keys = m->quad_sort = nil;
+    m->keys64[0] = m->keys64[1] = m->quad_aux[0] = m->quad_aux[1] = nil;
+    m->cxy_table = nil;
     m->img[0] = m->img[1] = nil;
     m->threshim = m->tiles = m->row_off = m->runs = nil;
     m->parent = m->count = m->dense = m->node_lbl = m->labels = nil;
@@ -280,6 +302,27 @@ static void setup_buffers(apriltag_metal_t *m, apriltag_detector_t *td,
     m->arena_off[slot] = ensure_buf(m, m->arena_off[slot], (size_t)p->clusters_cap*4);
     m->arena[slot] = ensure_buf(m, m->arena[slot],
                                 (size_t)8*p->clusters_cap + (size_t)8*p->records_cap);
+    m->keys64[slot] = ensure_buf(m, m->keys64[slot],
+                                 (size_t)8*p->clusters_cap + (size_t)8*p->records_cap);
+    m->quad_aux[slot] = ensure_buf(m, m->quad_aux[slot],
+                                   (size_t)p->clusters_cap*sizeof(ATQuadAux));
+    // exact centroids for the GPU key kernel: the CPU computes
+    // (min + max)*0.5 + noise in double and rounds to float; min+max is a
+    // small integer, so a host-built table reproduces it bit for bit
+    {
+        // pt coords are 2*actual: min+max sums reach 4*w-6 and 4*h-6
+        size_t tstride = (size_t)4*w;
+        size_t tlen = tstride + (size_t)4*h;
+        int had = m->cxy_table && m->cxy_table.length >= tlen*4;
+        m->cxy_table = ensure_buf(m, m->cxy_table, tlen*4);
+        if (!had) {
+            float *t = m->cxy_table.contents;
+            for (size_t i = 0; i < tstride; i++)
+                t[i] = (float)(i * 0.5 + 0.05118);
+            for (size_t i = 0; i < (size_t)4*h; i++)
+                t[tstride + i] = (float)(i * 0.5 + -0.028581);
+        }
+    }
     m->params_buf[slot] = ensure_buf(m, m->params_buf[slot], sizeof(ATParams));
     m->state_buf[slot] = ensure_buf(m, m->state_buf[slot], sizeof(ATState));
     m->shifts = ensure_buf(m, m->shifts, N_RADIX_PASSES*4);
@@ -334,6 +377,8 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
         id<MTLBuffer> arena = m->arena[slot];
         id<MTLBuffer> params_buf = m->params_buf[slot];
         id<MTLBuffer> state_buf = m->state_buf[slot];
+        id<MTLBuffer> keys64 = m->keys64[slot];
+        id<MTLBuffer> quad_aux = m->quad_aux[slot];
         ATParams *p = &m->p;
         uint32_t w = p->w, h = p->h;
 
@@ -534,6 +579,37 @@ static id<MTLCommandBuffer> frontend_commit(apriltag_metal_t *m,
             disp_indirect(enc, m->arena_scatter, state_buf, off_rec_tg, 256);
         }
 
+        // ---- per-cluster quad-fit prep: bbox, keys, segmented sort ----
+        {
+            const size_t off_quad_tg = offsetof(ATState, quad_tg);
+
+            [enc setBuffer:arena offset:0 atIndex:0];
+            [enc setBuffer:arena_off offset:0 atIndex:1];
+            [enc setBuffer:m->starts offset:0 atIndex:2];
+            [enc setBuffer:quad_aux offset:0 atIndex:3];
+            [enc setBuffer:state_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
+            disp_indirect(enc, m->quad_bbox, state_buf, off_quad_tg, 256);
+
+            [enc setBuffer:arena offset:0 atIndex:0];
+            [enc setBuffer:arena_off offset:0 atIndex:1];
+            [enc setBuffer:m->starts offset:0 atIndex:2];
+            [enc setBuffer:quad_aux offset:0 atIndex:3];
+            [enc setBuffer:keys64 offset:0 atIndex:4];
+            [enc setBuffer:m->cxy_table offset:0 atIndex:5];
+            [enc setBuffer:state_buf offset:0 atIndex:6];
+            [enc setBuffer:params_buf offset:0 atIndex:7];
+            disp_indirect(enc, m->quad_keys, state_buf, off_quad_tg, 256);
+
+            [enc setBuffer:arena_off offset:0 atIndex:0];
+            [enc setBuffer:m->starts offset:0 atIndex:1];
+            [enc setBuffer:quad_aux offset:0 atIndex:2];
+            [enc setBuffer:keys64 offset:0 atIndex:3];
+            [enc setBuffer:state_buf offset:0 atIndex:4];
+            [enc setBuffer:params_buf offset:0 atIndex:5];
+            disp_indirect(enc, m->quad_sort, state_buf, off_quad_tg, 256);
+        }
+
         [enc endEncoding];
         [cb commit];
         return cb;
@@ -664,6 +740,7 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
                     (cb.kernelEndTime - cb.kernelStartTime)*1e3);
         }
 
+        m->cur_slot = slot;
         ATState *st = m->state_buf[slot].contents;
         if (st->overflow) {
             fprintf(stderr, "apriltag_metal: overflow flags 0x%x; "
@@ -693,6 +770,29 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
 
         return clusters;
     }
+}
+
+// Per-cluster quad-fit prep computed by the GPU for the last consumed
+// frame: bbox, gradient dot, and the angle keys already sorted. Returns 0
+// when the cluster was too large for the in-threadgroup sort (the caller
+// runs the full CPU path).
+int apriltag_metal_quadprep(apriltag_metal_t *m, int cidx,
+                            struct apriltag_metal_quadprep *out)
+{
+    int slot = m->cur_slot;
+    const ATQuadAux *aux =
+        (const ATQuadAux *)m->quad_aux[slot].contents + cidx;
+    if (!aux->sorted)
+        return 0;
+    const uint32_t *arena_off = m->arena_off[slot].contents;
+    out->keys = (const uint64_t *)m->keys64[slot].contents
+              + arena_off[cidx]/8 + 1;
+    out->xmin = aux->xmin;
+    out->xmax = aux->xmax;
+    out->ymin = aux->ymin;
+    out->ymax = aux->ymax;
+    out->dot = aux->dot;
+    return 1;
 }
 
 ///////////////////////////////////////////////////////////////////////////

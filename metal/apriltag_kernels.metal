@@ -39,6 +39,7 @@ struct ATState {
     uint rec_tg[3];   // ceil(nrecords/256)
     uint radix_tg[3]; // ceil(nrecords/RADIX_BLOCK)
     uint cl_tg[3];    // ceil(nclusters/256)
+    uint quad_tg[3];  // nclusters (one threadgroup per cluster)
 };
 
 // 8-byte GPU run record (CPU's row_run + row index)
@@ -908,6 +909,9 @@ kernel void k_cluster_bounds(device const uint *keys [[buffer(0)]],
         st->cl_tg[0] = (ncl + 255)/256;
         st->cl_tg[1] = 1;
         st->cl_tg[2] = 1;
+        st->quad_tg[0] = min(ncl, p.clusters_cap);
+        st->quad_tg[1] = 1;
+        st->quad_tg[2] = 1;
         starts[min(ncl, p.clusters_cap)] = n; // sentinel for size computation
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -956,4 +960,274 @@ kernel void k_arena_scatter(device const gpu_pt *pts [[buffer(0)]],
     // arena_off is in bytes; header is 8 bytes, then 8-byte points
     uint slot = arena_off[c]/8 + 1 + rank;
     arena[slot] = pts[i];
+}
+
+///////////////////////////////////////////////////////////////////////////
+// stage 7: per-cluster quad-fit preparation. Mirrors the head of the
+// CPU's fit_quad(): bounding box, gradient-dot orientation sign, the
+// angle sort keys ((slope bits << 32) | ~index), and an in-threadgroup
+// bitonic sort of those keys, so the CPU skips straight to the line-fit
+// prefix sums. Keys are fp32-faithful to the CPU computation; ulp-level
+// divergence (the CPU rounds cx/cy through double) and bitonic tie
+// placement fall under the detection epsilon gate, not byte equality.
+
+#define QSORT_MAX 2048u // clusters longer than this sort on the CPU
+
+struct quad_aux {
+    ushort xmin, xmax, ymin, ymax;
+    float dot;
+    uint sorted; // 1 when this cluster's keys are sorted on the GPU
+};
+
+kernel void k_quad_bbox(device const gpu_pt *arena [[buffer(0)]],
+                        device const uint *arena_off [[buffer(1)]],
+                        device const uint *starts [[buffer(2)]],
+                        device quad_aux *aux [[buffer(3)]],
+                        device const ATState *st [[buffer(4)]],
+                        constant ATParams &p [[buffer(5)]],
+                        uint c [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup ushort red[4][8];
+    uint ncl = min(st->nclusters, p.clusters_cap);
+    if (c >= ncl)
+        return;
+    uint n = starts[c + 1] - starts[c];
+    device const gpu_pt *pts = arena + arena_off[c]/8 + 1;
+
+    ushort xmn = 0xffff, xmx = 0, ymn = 0xffff, ymx = 0;
+    for (uint i = tid; i < n; i += 256) {
+        gpu_pt q = pts[i];
+        xmn = min(xmn, q.x);
+        xmx = max(xmx, q.x);
+        ymn = min(ymn, q.y);
+        ymx = max(ymx, q.y);
+    }
+    xmn = simd_min(xmn);
+    xmx = simd_max(xmx);
+    ymn = simd_min(ymn);
+    ymx = simd_max(ymx);
+    if (lane == 0) {
+        red[0][sg] = xmn;
+        red[1][sg] = xmx;
+        red[2][sg] = ymn;
+        red[3][sg] = ymx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        quad_aux a;
+        a.xmin = 0xffff; a.xmax = 0; a.ymin = 0xffff; a.ymax = 0;
+        for (uint s = 0; s < 8; s++) {
+            a.xmin = min(a.xmin, red[0][s]);
+            a.xmax = max(a.xmax, red[1][s]);
+            a.ymin = min(a.ymin, red[2][s]);
+            a.ymax = max(a.ymax, red[3][s]);
+        }
+        a.dot = 0.0f;
+        a.sorted = n <= QSORT_MAX ? 1u : 0u;
+        aux[c] = a;
+    }
+}
+
+// the CPU's slope_sort_key: monotone float-bits -> u32 transform
+static inline uint slope_key_bits(float slope)
+{
+    uint u = as_type<uint>(slope);
+    return u ^ ((uint)((int)u >> 31) | 0x80000000u);
+}
+
+kernel void k_quad_keys(device const gpu_pt *arena [[buffer(0)]],
+                        device const uint *arena_off [[buffer(1)]],
+                        device const uint *starts [[buffer(2)]],
+                        device quad_aux *aux [[buffer(3)]],
+                        device ulong *keys_arena [[buffer(4)]],
+                        device const float *cxy_table [[buffer(5)]],
+                        device const ATState *st [[buffer(6)]],
+                        constant ATParams &p [[buffer(7)]],
+                        uint c [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float dred[8];
+    uint ncl = min(st->nclusters, p.clusters_cap);
+    if (c >= ncl)
+        return;
+    uint n = starts[c + 1] - starts[c];
+    uint base = arena_off[c]/8 + 1;
+    device const gpu_pt *pts = arena + base;
+    device ulong *keys = keys_arena + base;
+
+    quad_aux a = aux[c];
+    // host-computed in double then rounded, exactly like the CPU's
+    // (xmin + xmax) * 0.5 + noise expression (Metal has no fp64)
+    // pt coords are 2*actual, so min+max spans [0, 4*max_dim)
+    uint tstride = 4u*p.w;
+    float cx = cxy_table[(uint)a.xmin + a.xmax];
+    float cy = cxy_table[tstride + (uint)a.ymin + a.ymax];
+
+    float dot = 0.0f;
+    for (uint i = tid; i < n; i += 256) {
+        gpu_pt q = pts[i];
+        float dx = (float)q.x - cx;
+        float dy = (float)q.y - cy;
+
+        dot += dx*(float)q.gx + dy*(float)q.gy;
+
+        // quadrants[dy > 0][dx > 0], as on the CPU
+        float quadrant = (dy > 0.0f)
+            ? ((dx > 0.0f) ? (float)(2 << 15) : (float)(2*(2 << 15)))
+            : ((dx > 0.0f) ? 0.0f : (float)(-1*(2 << 15)));
+        if (dy < 0.0f) {
+            dy = -dy;
+            dx = -dx;
+        }
+        if (dx < 0.0f) {
+            float tmp = dx;
+            dx = dy;
+            dy = -tmp;
+        }
+        keys[i] = ((ulong)slope_key_bits(quadrant + dy/dx) << 32)
+                | (uint)~i;
+    }
+
+    // reduction order differs from the CPU's; the dot only decides the
+    // border-orientation sign, far from zero for any usable cluster
+    dot = simd_sum(dot);
+    if (lane == 0)
+        dred[sg] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float d = 0.0f;
+        for (uint s = 0; s < 8; s++)
+            d += dred[s];
+        aux[c].dot = d;
+    }
+}
+
+// Tie-rank of original index i under the CPU merge sort: the CPU sorts
+// <=5-element leaves (recursive halving of [0, n)) with networks that
+// compare only the slope word — equal-slope elements end up in a
+// configuration-dependent network order — and every merge above compares
+// the full unique key, which places equal-slope runs leaf-descending.
+// Returns ((~leaf_lo & 0x7ff) << 3) | network_pos: ascending order of
+// this value reproduces the CPU's order within an equal-slope run.
+static inline uint sort_tie_rank(device const ulong *keys, uint i, uint n)
+{
+    uint lo = 0, ln = n;
+    while (ln > 5) {
+        uint a = ln >> 1;
+        if (i < lo + a) {
+            ln = a;
+        } else {
+            lo += a;
+            ln -= a;
+        }
+    }
+    ulong k[5];
+    for (uint t = 0; t < ln; t++)
+        k[t] = keys[lo + t];
+#define MAYBE_SWAP(A, B)     if ((k[A] >> 32) > (k[B] >> 32)) { ulong tmp = k[A]; k[A] = k[B]; k[B] = tmp; }
+    if (ln == 2) {
+        MAYBE_SWAP(0, 1)
+    } else if (ln == 3) {
+        MAYBE_SWAP(0, 1) MAYBE_SWAP(1, 2) MAYBE_SWAP(0, 1)
+    } else if (ln == 4) {
+        MAYBE_SWAP(0, 1) MAYBE_SWAP(2, 3) MAYBE_SWAP(0, 2)
+        MAYBE_SWAP(1, 3) MAYBE_SWAP(1, 2)
+    } else if (ln == 5) {
+        MAYBE_SWAP(0, 1) MAYBE_SWAP(3, 4) MAYBE_SWAP(1, 2)
+        MAYBE_SWAP(0, 1) MAYBE_SWAP(0, 3) MAYBE_SWAP(2, 4)
+        MAYBE_SWAP(1, 2) MAYBE_SWAP(2, 3) MAYBE_SWAP(1, 2)
+    }
+#undef MAYBE_SWAP
+    ulong mine = keys[i];
+    uint pos = 0;
+    for (uint t = 0; t < ln; t++)
+        if (k[t] == mine)
+            pos = t;
+    return ((~lo & 0x7ffu) << 3) | pos;
+}
+
+// in-threadgroup bitonic sort of one cluster's keys. Full u64 compares
+// give the unique ascending order (the low complemented-index word makes
+// every key unique); a fixup pass then reorders equal-slope runs into the
+// CPU merge sort's tie order via sort_tie_rank, so the output matches
+// pt_key_sort exactly.
+kernel void k_quad_sort(device const uint *arena_off [[buffer(0)]],
+                        device const uint *starts [[buffer(1)]],
+                        device const quad_aux *aux [[buffer(2)]],
+                        device ulong *keys_arena [[buffer(3)]],
+                        device const ATState *st [[buffer(4)]],
+                        constant ATParams &p [[buffer(5)]],
+                        uint c [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup ulong buf[QSORT_MAX];
+    threadgroup ushort dest[QSORT_MAX];
+    uint ncl = min(st->nclusters, p.clusters_cap);
+    if (c >= ncl)
+        return;
+    uint n = starts[c + 1] - starts[c];
+    if (n > QSORT_MAX || n < 2)
+        return;
+    device ulong *keys = keys_arena + arena_off[c]/8 + 1;
+
+    // next power of two
+    uint m = 2;
+    while (m < n)
+        m <<= 1;
+
+    for (uint i = tid; i < m; i += 256)
+        buf[i] = i < n ? keys[i] : 0xFFFFFFFFFFFFFFFFul;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2; k <= m; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = tid; i < m/2; i += 256) {
+                // index of the i-th comparator's low element
+                uint a = ((i & ~(j - 1)) << 1) | (i & (j - 1));
+                uint b = a | j;
+                bool up = (a & k) == 0;
+                ulong va = buf[a], vb = buf[b];
+                if ((va > vb) == up) {
+                    buf[a] = vb;
+                    buf[b] = va;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // `keys` still holds the original order here; sort_tie_rank reads it
+    for (uint t = tid; t < n; t += 256) {
+        ulong v = buf[t];
+        uint hi = (uint)(v >> 32);
+        // untied elements (the common case) stay put
+        if ((t == 0 || (uint)(buf[t - 1] >> 32) != hi) &&
+            (t == n - 1 || (uint)(buf[t + 1] >> 32) != hi)) {
+            dest[t] = (ushort)t;
+            continue;
+        }
+        uint st = t;
+        while (st > 0 && (uint)(buf[st - 1] >> 32) == hi)
+            st--;
+        uint my = sort_tie_rank(keys, ~(uint)v, n);
+        uint rank = 0;
+        for (uint u = st; u < n; u++) {
+            ulong w = buf[u];
+            if ((uint)(w >> 32) != hi)
+                break;
+            if (u == t)
+                continue;
+            rank += sort_tie_rank(keys, ~(uint)w, n) < my ? 1u : 0u;
+        }
+        dest[t] = (ushort)(st + rank);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = tid; t < n; t += 256)
+        keys[dest[t]] = buf[t];
 }

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "apriltag.h"
+#include "apriltag_quad_internal.h"
 #include "common/image_u8.h"
 #include "common/zarray.h"
 
@@ -35,6 +36,11 @@ zarray_t *apriltag_metal_clusters(apriltag_metal_t *m, apriltag_detector_t *td,
 // Called via apriltag_detector_detect_prepare.
 void apriltag_metal_frontend_begin(apriltag_metal_t *m, apriltag_detector_t *td,
                                    image_u8_t *im);
+
+// fills out for cluster index cidx of the last apriltag_metal_clusters
+// result; returns 0 when the GPU left this cluster for the CPU path
+int apriltag_metal_quadprep(apriltag_metal_t *m, int cidx,
+                            struct apriltag_metal_quadprep *out);
 
 #ifdef __cplusplus
 }
