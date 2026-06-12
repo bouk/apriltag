@@ -10,12 +10,25 @@ BUILD_DIR=${BUILD_DIR:-build}
 BASE=${BASE:-benchmark_results/dets-baseline.tsv}
 BASE_TIMING=${BASE_TIMING:-benchmark_results/timing-baseline.tsv}
 
-cmake --build "$BUILD_DIR" -j "$(nproc)" > /dev/null
+NJOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+cmake --build "$BUILD_DIR" -j "$NJOBS" > /dev/null
+
+if [ -d vide_images2 ]; then
+    IMAGE_DIR=${IMAGE_DIR:-vide_images2}
+else
+    IMAGE_DIR=${IMAGE_DIR:-vide_images/vide_images2}
+fi
+THREADS=${THREADS:-4}
+CPUS=${CPUS:-0-3}
+
+# CPU pinning is Linux-only; macOS has no user affinity API
+PIN=()
+command -v taskset > /dev/null && PIN=(taskset -c "$CPUS")
 
 export LD_LIBRARY_PATH="$BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-"$BUILD_DIR/apriltag_demo" -t 4 -i 1 -x 1.0 -f tagStandard52h13 \
+"${PIN[@]}" "$BUILD_DIR/apriltag_demo" -t "$THREADS" -i 1 -x 1.0 -f tagStandard52h13 \
     --save-detections /tmp/dets_new.tsv --save-timing /tmp/timing_new.tsv \
-    vide_images/*.jpg > /dev/null
+    "$IMAGE_DIR"/*.jpg > /dev/null
 
 # detections: (image,id) sets must match exactly; hamming exact;
 # corners/center within 0.1px; margin within 1.0
