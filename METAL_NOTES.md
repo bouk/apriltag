@@ -15,7 +15,8 @@ branch combines it with the NEON CPU port (`PERF_NOTES.md`). Measured on an M3 P
 | threshold + RLE | GPU | tile 4×4 min/max, 3×3 clamped blur, threshold, per-row RLE into run tables |
 | unionfind (CCL) | GPU | run-indexed union-find reproducing `connect_runs_to_prev`, min-root CAS union, label paint |
 | make clusters | GPU | boundary emission in legacy (y, x, conn) order, stable radix sort by cluster key, packed `pt_list` arena |
-| fit quads | CPU | reads the arena-backed `pt_list`s directly (`do_quad_task` skips the free when `td->metal` is set) |
+| fit quads head | GPU | per-cluster bbox, gradient dot, angle keys, and the slope sort (bit-exact to `pt_key_sort`, tie order included); clusters > 2048 points fall back |
+| fit quads body | CPU | line-fit prefix sums onward, reading the arena-backed `pt_list`s and GPU keys directly |
 | decode + refine | CPU | unchanged |
 
 Output is **identical** to the CPU pipeline on the corpus: 4583/4583
@@ -91,12 +92,25 @@ next detect on the same slot.
   10.8); at 12 saturated threads the gain drowns in noise (~8 ms either
   way). Still byte-identical: 4583/4583, max delta 0.0 px.
 
+- **The angle sort moved to the GPU bit-exactly.** The merge sort was
+  ~half of fit_quads on the CPU profile. The GPU reproduces it exactly:
+  a host-built table supplies the double-rounded cx/cy floats Metal's
+  missing fp64 can't compute, safe math gives IEEE divides, and a
+  post-bitonic fixup (`sort_tie_rank`) replays the CPU leaf networks'
+  configuration-dependent tie order. `APRILTAG_QP_CHECK=1` recomputes
+  keys on the CPU per cluster: zero mismatches corpus-wide. fit_quads
+  10.8 -> 6.8 ms at 4 threads (detector 13.4 -> 11.3, wall 4.26 ->
+  3.86 s); at 12 saturated threads the longer GPU chain cancels the
+  smaller back-half and wall is unchanged.
+
 ## Environment toggles
 
 - `APRILTAG_METAL=1` — enable the GPU front-end (off by default).
 - `APRILTAG_METAL_VALIDATE=1` — run the CPU reference stages each frame
   and byte-compare intermediates (slow; single-threaded use).
 - `APRILTAG_METAL_PROF=1` — per-frame encode/wait/GPU times on stderr.
+- `APRILTAG_QP_CHECK=1` — recompute the angle keys on the CPU per
+  cluster and compare against the GPU's (slow; for development).
 
 ## Gotchas / decisions log
 
