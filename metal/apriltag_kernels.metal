@@ -710,11 +710,14 @@ kernel void k_emit_scatter(device const uchar *t [[buffer(0)]],
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// stage 5: stable LSD radix sort of records by 30-bit key, 5 bits/pass
+// stage 5: stable LSD radix sort of records by 30-bit key, 8 bits/pass.
+// Within a block the 1024 elements are processed in 4 strided rounds
+// (idx = block*1024 + round*256 + tid), so lane order == index order and
+// the simdgroup-ballot ranking below is stable.
 
-#define RADIX_BITS 5u
-#define RADIX_BINS 32u
-#define RADIX_EPT 4u // elements per thread; 256 threads -> 1024 per block
+#define RADIX_BITS 8u
+#define RADIX_BINS 256u
+#define RADIX_EPT 4u // rounds per block; 256 threads -> 1024 per block
 
 kernel void k_radix_hist(device const uint *keys [[buffer(0)]],
                          device uint *hist [[buffer(1)]], // [bin][block]
@@ -724,14 +727,12 @@ kernel void k_radix_hist(device const uint *keys [[buffer(0)]],
                          uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup atomic_uint local_hist[RADIX_BINS];
-    if (tid < RADIX_BINS)
-        atomic_store_explicit(&local_hist[tid], 0u, memory_order_relaxed);
+    atomic_store_explicit(&local_hist[tid], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint n = st->nrecords;
-    uint base = b*RADIX_BLOCK + tid*RADIX_EPT;
-    for (uint i = 0; i < RADIX_EPT; i++) {
-        uint idx = base + i;
+    for (uint r = 0; r < RADIX_EPT; r++) {
+        uint idx = b*RADIX_BLOCK + r*256 + tid;
         if (idx < n) {
             uint d = (keys[idx] >> shift) & (RADIX_BINS - 1);
             atomic_fetch_add_explicit(&local_hist[d], 1u, memory_order_relaxed);
@@ -740,9 +741,8 @@ kernel void k_radix_hist(device const uint *keys [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint nblocks = st->radix_tg[0];
-    if (tid < RADIX_BINS)
-        hist[tid*nblocks + b] =
-            atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
+    hist[tid*nblocks + b] =
+        atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
 }
 
 kernel void k_radix_scan(device uint *hist [[buffer(0)]],
@@ -780,7 +780,9 @@ kernel void k_radix_scan(device uint *hist [[buffer(0)]],
     }
 }
 
-// stable scatter: per-block ranks via a [thread][bin] u16 matrix
+// stable scatter: ranks within each round via simdgroup digit-match
+// ballots, across simdgroups via per-bin leader counts, across rounds via
+// a running per-bin total
 kernel void k_radix_scatter(device const uint *keys_in [[buffer(0)]],
                             device const gpu_pt *pts_in [[buffer(1)]],
                             device uint *keys_out [[buffer(2)]],
@@ -789,61 +791,60 @@ kernel void k_radix_scatter(device const uint *keys_in [[buffer(0)]],
                             device const ATState *st [[buffer(5)]],
                             constant uint &shift [[buffer(6)]],
                             uint b [[threadgroup_position_in_grid]],
-                            uint tid [[thread_position_in_threadgroup]])
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup ushort m[256][RADIX_BINS]; // 16 KB
+    threadgroup uint running[RADIX_BINS];   // placed in earlier rounds
+    threadgroup ushort sg_cnt[8][RADIX_BINS]; // per-simdgroup counts, this round
     uint n = st->nrecords;
-    uint base = b*RADIX_BLOCK + tid*RADIX_EPT;
-
-    uint my_keys[RADIX_EPT];
-    uint my_digit[RADIX_EPT];
-    ushort counts[RADIX_BINS];
-    for (uint d = 0; d < RADIX_BINS; d++)
-        counts[d] = 0;
-    for (uint i = 0; i < RADIX_EPT; i++) {
-        uint idx = base + i;
-        if (idx < n) {
-            my_keys[i] = keys_in[idx];
-            uint d = (my_keys[i] >> shift) & (RADIX_BINS - 1);
-            my_digit[i] = d;
-            counts[d]++;
-        } else {
-            my_digit[i] = RADIX_BINS; // sentinel
-        }
-    }
-    for (uint d = 0; d < RADIX_BINS; d++)
-        m[tid][d] = counts[d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // exclusive column scans across the 256 threads (Hillis-Steele)
-    for (uint off = 1; off < 256; off <<= 1) {
-        ushort vals[RADIX_BINS];
-        if (tid >= off)
-            for (uint d = 0; d < RADIX_BINS; d++)
-                vals[d] = m[tid - off][d];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid >= off)
-            for (uint d = 0; d < RADIX_BINS; d++)
-                m[tid][d] += vals[d];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // m[tid][d] is now the inclusive prefix; exclusive = inclusive - own
     uint nblocks = st->radix_tg[0];
-    uint prior[RADIX_BINS];
-    for (uint d = 0; d < RADIX_BINS; d++)
-        prior[d] = (uint)m[tid][d] - counts[d];
 
-    uint seen[RADIX_BINS];
-    for (uint d = 0; d < RADIX_BINS; d++)
-        seen[d] = 0;
-    for (uint i = 0; i < RADIX_EPT; i++) {
-        uint d = my_digit[i];
-        if (d >= RADIX_BINS)
-            continue;
-        uint pos = hist[d*nblocks + b] + prior[d] + seen[d];
-        seen[d]++;
-        keys_out[pos] = my_keys[i];
-        pts_out[pos] = pts_in[base + i];
+    running[tid] = 0;
+
+    for (uint r = 0; r < RADIX_EPT; r++) {
+        // zero this round's counts (each thread owns one bin column)
+        for (uint s = 0; s < 8; s++)
+            sg_cnt[s][tid] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint idx = b*RADIX_BLOCK + r*256 + tid;
+        bool valid = idx < n;
+        uint key = 0, d = 0;
+        if (valid) {
+            key = keys_in[idx];
+            d = (key >> shift) & (RADIX_BINS - 1);
+        }
+
+        // mask of lanes in this simdgroup carrying the same digit
+        uint match = valid ? 0xFFFFFFFFu : 0u;
+        for (uint bit = 0; bit < RADIX_BITS; bit++) {
+            uint bal = (uint)(simd_vote::vote_t)simd_ballot((d >> bit) & 1);
+            match &= ((d >> bit) & 1) ? bal : ~bal;
+        }
+        match &= (uint)(simd_vote::vote_t)simd_ballot(valid);
+
+        uint rank_in_sg = popcount(match & ((1u << lane) - 1u));
+        if (valid && rank_in_sg == 0) // one leader per distinct digit
+            sg_cnt[sg][d] = (ushort)popcount(match);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid) {
+            uint prior_sgs = 0;
+            for (uint s = 0; s < sg; s++)
+                prior_sgs += sg_cnt[s][d];
+            uint pos = hist[d*nblocks + b] + running[d] + prior_sgs + rank_in_sg;
+            keys_out[pos] = key;
+            pts_out[pos] = pts_in[idx];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // fold this round's counts into the running per-bin totals
+        uint round_total = 0;
+        for (uint s = 0; s < 8; s++)
+            round_total += sg_cnt[s][tid];
+        running[tid] += round_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

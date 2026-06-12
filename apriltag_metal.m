@@ -48,8 +48,8 @@ typedef struct {
 } ATState;
 
 #define RADIX_BLOCK 1024u
-#define RADIX_BINS 32u
-#define N_RADIX_PASSES 6u // 30-bit keys, 5 bits per pass
+#define RADIX_BINS 256u
+#define N_RADIX_PASSES 4u // 30-bit keys, 8 bits per pass
 
 struct apriltag_metal {
     id<MTLDevice> dev;
@@ -267,7 +267,7 @@ static void setup_buffers(apriltag_metal_t *m, apriltag_detector_t *td,
     memcpy(m->params_buf.contents, p, sizeof(*p));
     uint32_t *sh = m->shifts.contents;
     for (uint32_t i = 0; i < N_RADIX_PASSES; i++)
-        sh[i] = 5*i;
+        sh[i] = 8*i;
 
     m->cur_w = w;
     m->cur_h = h;

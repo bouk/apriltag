@@ -38,6 +38,7 @@ DEMO_FLAGS=(-t "$THREADS" -i 1 -x 1.0 -f tagStandard52h13
 
 mkdir -p benchmark_results
 hyperfine \
+    --prepare 'sleep 3' \
     --shell=none \
     --warmup "$WARMUP" \
     --runs "$RUNS" \
