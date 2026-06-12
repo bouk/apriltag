@@ -1,112 +1,109 @@
-# Metal GPU detector port (Apple Silicon) — design + progress
+# Metal GPU campaign (Apple Silicon, M3 Pro)
 
-Goal: replace every profitable stage of the AprilTag detector with Metal GPU
-compute on Apple Silicon (M3 Pro: 6P+6E CPU, 18-core GPU, unified memory),
-benchmarked over the 287-image `vide_images/` corpus (3088x2064 grayscale,
-tagStandard52h13, `-t N -i 1 -x 1.0`).
+Port of the GPU front-end to Metal for Apple-Silicon Macs, mirroring the
+OpenCL campaign in `GPU_NOTES.md`. Measured on an M3 Pro (6P+6E CPU,
+18-core GPU, unified memory) over the 133-image `vide_images2` corpus
+(3088×2064, tagStandard52h13, `-x 1.0`); per-commit benchmarks live in
+`results.tsv` (hyperfine via `bench.sh`), output equivalence is gated by
+`check.sh` against `benchmark_results/dets-baseline-macos.tsv`.
 
-## Baselines on this machine (M3 Pro, Release, -mcpu=native)
+## What runs where
 
-CPU per-stage (t=12, mean ms/image, stable across reruns; machine noise can
-produce 2x outliers — always interleave A/B for comparisons):
+| stage | where | notes |
+| --- | --- | --- |
+| threshold + RLE | GPU | tile 4×4 min/max, 3×3 clamped blur, threshold, per-row RLE into run tables |
+| unionfind (CCL) | GPU | run-indexed union-find reproducing `connect_runs_to_prev`, min-root CAS union, label paint |
+| make clusters | GPU | boundary emission in legacy (y, x, conn) order, stable radix sort by cluster key, packed `pt_list` arena |
+| fit quads | CPU | reads the arena-backed `pt_list`s directly (`do_quad_task` skips the free when `td->metal` is set) |
+| decode + refine | CPU | unchanged |
 
-| stage          | t=12  |
-|----------------|-------|
-| threshold      | 2.02  |
-| unionfind      | 1.81  |
-| make clusters  | 5.29  |
-| fit quads      | 6.04  |
-| decode+refine  | 1.03  |
-| total          | 16.22 |
+Output is **identical** to the CPU pipeline on the corpus: 4583/4583
+detections, ids and hamming exact, max coordinate delta 0.0 px. The GPU
+path is opt-in via `APRILTAG_METAL=1` and falls back to the CPU pipeline
+when no Metal device is available.
 
-t=4: 30.1 ms. Reference detections: `benchmark_results/dets-macos-cpu.tsv`
-(9784 dets, byte-identical for t=4..12). Wall for 287 images t=12: ~10.4 s
-(includes JPEG decode, single process).
+## Headline numbers (results.tsv has the full history)
 
-Fixed en route: `ctasks[16]` stack overflow in gradient_clusters when
-nthreads > 4 (now VLA sized 4*nthreads+1). ASan-clean at t=6/12 now.
+| config | wall (corpus) | detector ms/img | user CPU s |
+| --- | --- | --- | --- |
+| CPU-only, 4 threads | 6.19 s | 30.3 | 16.8 |
+| CPU-only, 12 threads | 4.45 s | 17.0 | 21.7 |
+| Metal pipelined, 4 threads | 4.20 s | 14.5 | 9.0 |
+| Metal pipelined, 12 threads | 3.23 s | 7.9 | 11.2 |
 
-## Architecture (milestone A)
+1.38× faster wall and 2.15× faster detector than the best CPU config at
+12 threads, with ~50% of the CPU time — the freed CPU headroom being the
+actual point, as on the NUC15.
 
-GPU front-end replaces threshold + unionfind + make-clusters; CPU keeps
-fit_quads + decode (they only need `im` + clusters). Hook at the top of
-`apriltag_quad_thresh()`: if `td->metal` is non-NULL, get clusters from
-`apriltag_metal_clusters()` instead of threshold/CCL/gradient_clusters.
-Enabled via env `APRILTAG_METAL=1` (detector_create tries to init; falls
-back to CPU silently if no device). `APRILTAG_METAL_VALIDATE=1` runs the
-CPU reference stages too and byte-compares intermediates per frame.
+## Architecture
 
-Kernel chain (one shared-memory MTLCommandBuffer per frame, bounds-checked
-writes + overflow flag -> host grows buffers and retries the frame):
+One serial compute command buffer encodes the whole front-end
+(`frontend_commit`); sequential dispatches in a serial encoder are
+ordered, including the indirect dispatch arguments the scan kernels
+write, so there are no intermediate host round-trips.
+`apriltag_detector_detect_prepare` commits the chain for the upcoming
+frame without waiting; `apriltag_metal_clusters` then only waits for the
+in-flight work. With the demo's one-image lookahead the GPU runs under
+the next JPEG load and the steady-state front-end wait is ~0–3 ms.
 
-1. tile 4x4 min/max -> 2 (tw x th) u8 planes
-2. 3x3 clamped dilate/erode blur of the tile planes
-3. threshold -> threshim (0/255/127) incl. right-edge cols using last
-   tile, bottom partial rows (no 127 there)
-4. RLE per row over x in [0, w-2], 127 runs skipped: count -> scan ->
-   fill {start u16, end u16, v u8 (pad to 6B)} at row_off[y]
-5. run-indexed union-find (parent u32), nodes = runs + per-row virtual
-   last-column node (vcol_base + y, vcol_base = total runs):
-   connect run pairs of adjacent rows per connect_runs_to_prev rules:
-   - same v, vertical overlap clamped to x>=1
-   - v==255 also diagonal +-1 contact (same clamps)
-   - white run ending at w-2 + buf[y-1][w-1]==255 && buf[y-1][w-2]!=255
-     -> union with vcol node (y-1)
-   GPU union: CAS-hooking, min-root convention; then flatten; component
-   pixel counts via atomic add (run length; vcol nodes +1)
-6. label image u32 (w x h): INVALID everywhere, then per usable run
-   (count >= min_cluster_pixels) paint root; vcol pixels painted too
-7. boundary emission, per pixel x in [1, w-2], y in [0, h-2], conn order
-   (1,0),(0,1),(-1,1),(1,1); emit iff v0+v1==255 && both labels valid;
-   (-1,1) suppressed iff pixel x-1 emitted its (1,1) (pure local recompute:
-   labels(x-1,y), labels(x,y+1), values). Points: x=2x+dx, y=2y+dy,
-   gradient (dx*(v1-v0), dy*(v1-v0)). Record = {key u64 = clusterid,
-   pt 8B} where clusterid = minmax pair of root ids exactly like CPU.
-   Two-pass: per-threadgroup counts -> scan -> ordered scatter (preserves
-   the legacy (y, x, conn) global order -> per-cluster point order legacy)
-8. stable LSD radix sort of records by 40-bit key (reps < 2^20-ish)
-9. cluster boundaries -> per-cluster {offset,size}; arena buffer written
-   as packed pt_list {i32 size, i32 pad, pts[]}; CPU builds zarray of
-   pt_list* pointing into the arena (do_quad_task must NOT free those:
-   guarded by td->metal flag)
+The five CPU-visible buffers (image staging, params, state, cluster
+arena + offsets) are double-buffered per pipeline slot and the pending
+queue is mutex-guarded, so prepare may be issued from another thread
+while detect runs. GPU-internal scratch is shared; Metal's hazard
+tracking serializes successive command buffers over it.
 
-Equivalence claim to verify: partition + per-cluster point sequences are
-exactly CPU's; only inter-cluster zarray order differs (CPU: hash-bucket
-then id; GPU: id asc). t=4..12 CPU runs are byte-identical despite
-different chunking, suggesting order-insensitivity downstream; verified
-empirically against dets-macos-cpu.tsv (epsilon: ids/hamming exact,
-coords <= 0.1 px). If order matters, sort clusters by (u64hash_2(id) &
-(nclustermap-1), id) instead.
+Clusters land in one GPU arena as packed `pt_list` records — the zarray
+handed to `fit_quads` holds pointers into the arena, valid until the
+next detect on the same slot.
 
-## Files
+## Findings (measured)
 
-- `metal/apriltag_kernels.metal` — all GPU kernels
-- `apriltag_metal.h` / `apriltag_metal.m` — C API + ObjC host (ARC)
-- `apriltag_quad_internal.h` — shared struct pt/pt_list/internal decls
-- CMake: APRILTAG_METAL option (default ON on APPLE): compiles metallib
-  via xcrun at build time, embeds bytes via generated C array; links
-  Metal/Foundation frameworks
-- Detector integration: `void *metal` field appended to apriltag_detector
+- **Serial offload breaks even; overlap wins.** Serial Metal front-end
+  at 12 threads: 26.3 ms/image vs 17.0 CPU-only. Pipelined via
+  `detect_prepare`: 7.9 ms. Same lesson as the NUC15.
+- **Power coupling, amplified.** With 12 CPU threads busy, the same GPU
+  chain stretches from ~7 ms to 14–22 ms (shared package power). It is
+  invisible in the demo because the GPU overlaps the single-threaded
+  JPEG decode, not the parallel back-half.
+- **Sustained saturation throttles the package.** ~30 s of continuous
+  CPU+GPU load trips a throttle that stretches GPU time ~2.4× and wall
+  runs from 3.3 s to 6.7–15 s; recovery takes seconds. `bench.sh` sleeps
+  3 s between hyperfine runs to keep benchmarks in the fast state.
+- **Deeper pipelining bought nothing here.** A demo variant decoding
+  JPEGs (and preparing frames) on a worker thread — GPU N+1 under CPU
+  back-half N, enabled by the double-buffered slots — measured 3.2–3.4 s
+  cool, i.e. equal to the simple lookahead, because the power-coupled
+  GPU stretches until the GPU-wait + back-half chain matches the decode
+  it was hiding; and with no idle duty cycle the throttle hits within a
+  run (15 s, user time doubling as clocks halve). Not adopted; the
+  library support remains.
+- **The dispatch chain is latency-bound, not ALU-bound.** Rewriting the
+  radix sort from 6×5-bit passes (Hillis-Steele [256][32] matrix) to
+  4×8-bit passes with simdgroup-ballot ranking cut corpus-mean GPU time
+  only 15.5 → 14.8 ms/frame despite removing a third of the sort work.
+  Kept for the smaller footprint.
+- Apple GPUs have no fp64, so the NUC15's bit-exact GPU quad fitter
+  cannot port; `fit_quads` stays on the CPU (where it is the dominant
+  detector cost — 5.6 ms at 12 threads; the NEON work on the `faster3`
+  branch is the relevant follow-up, not Metal).
 
-## Milestones / status
+## Environment toggles
 
-- [x] M0: CPU baseline + thread-scaling fix
-- [ ] M-A: GPU threshold+CCL+clusters, CPU fit_quads+decode, dets-equal
-- [ ] M-B: fit_quads on GPU (fp32 — epsilon drift expected, gate 0.1px)
-- [ ] M-C: decode placement decision, frame pipelining, max throughput
-- [ ] Report
+- `APRILTAG_METAL=1` — enable the GPU front-end (off by default).
+- `APRILTAG_METAL_VALIDATE=1` — run the CPU reference stages each frame
+  and byte-compare intermediates (slow; single-threaded use).
+- `APRILTAG_METAL_PROF=1` — per-frame encode/wait/GPU times on stderr.
 
 ## Gotchas / decisions log
 
-- The Bash tool shell here is zsh: `$var` does NOT word-split; `echo ===`
-  eats `===`. Use globs directly.
-- benchmark.sh/ab.sh are Linux (taskset/nproc); use direct runs + the awk
-  one-liners on macOS. Warmup run first; interleave A/B; expect occasional
-  2x outliers (background load).
-- timing tsv: stage rows per image; `awk -F'\t' 'NR>1{s+=$5;img[$1]=1}
-  END{c=0;for(i in img)c++;print s/c}'` = detector ms/image.
-- pt coordinates are 2*actual (half-pixel grid); gx/gy in {-255,0,255}.
-- uf size semantics: size[root]+1 == component pixel count.
-- Metal: no 64-bit CAS; use u32 parents (runs < 2^32). newBufferWithBytesNoCopy
-  needs 16KB-page-aligned base + length; image_u8 allocs are not page-aligned
-  -> copy in (6.4MB ~0.2ms) for now, or patch allocator later.
+- `pt` coordinates are 2×actual (half-pixel grid); gx/gy ∈ {−255,0,255}.
+- Cluster keys pack two 15-bit dense component ids (`comps_cap` ≤ 32768).
+- The kernel source is embedded via `xxd` and compiled at
+  `apriltag_detector_create`; first frame pays ~60 ms of PSO compilation.
+- ~20 of ~2300 clusters per frame differ from the CPU sequence in point
+  membership (240/719k points on the probe frame); every detection and
+  coordinate still matches the CPU pipeline exactly across the corpus —
+  these clusters never survive quad fitting differently. Inherited from
+  the original port; documented, not yet root-caused.
+- macOS benchmarking: interleave A/B runs and use `bench.sh`'s cool-down;
+  single-image `-i N` loops are unstable as the GPU shifts power states.
