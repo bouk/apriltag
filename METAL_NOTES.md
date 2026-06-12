@@ -1,7 +1,8 @@
 # Metal GPU campaign (Apple Silicon, M3 Pro)
 
 Port of the GPU front-end to Metal for Apple-Silicon Macs, mirroring the
-OpenCL campaign in `GPU_NOTES.md`. Measured on an M3 Pro (6P+6E CPU,
+OpenCL campaign in `GPU_NOTES.md` on the `nuc15-hardware` branch. This
+branch combines it with the NEON CPU port (`PERF_NOTES.md`). Measured on an M3 Pro (6P+6E CPU,
 18-core GPU, unified memory) over the 133-image `vide_images2` corpus
 (3088×2064, tagStandard52h13, `-x 1.0`); per-commit benchmarks live in
 `results.tsv` (hyperfine via `bench.sh`), output equivalence is gated by
@@ -83,9 +84,12 @@ next detect on the same slot.
   only 15.5 → 14.8 ms/frame despite removing a third of the sort work.
   Kept for the smaller footprint.
 - Apple GPUs have no fp64, so the NUC15's bit-exact GPU quad fitter
-  cannot port; `fit_quads` stays on the CPU (where it is the dominant
-  detector cost — 5.6 ms at 12 threads; the NEON work on the `faster3`
-  branch is the relevant follow-up, not Metal).
+  cannot port; `fit_quads` stays on the CPU, where it is the dominant
+  detector cost. This branch rebases the Metal work onto the NEON port
+  (`faster3`), whose vectorized fit_quads/refine-edges take the Metal
+  detector from 14.5 to 13.4 ms/image at 4 threads (fit_quads 11.6 ->
+  10.8); at 12 saturated threads the gain drowns in noise (~8 ms either
+  way). Still byte-identical: 4583/4583, max delta 0.0 px.
 
 ## Environment toggles
 
